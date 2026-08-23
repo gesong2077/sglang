@@ -133,15 +133,16 @@ def awq_gemm_kernel(
     pid_m = pid // num_pid_n
     pid_n = pid % num_pid_n
 
-    accumulator_dtype = c_ptr.type.element_ty
-
     # NOTE: This doesn't work in TRITON_INTERPRET=1 mode.  Use below instead.
     # accumulator = tl.arange(0, BLOCK_SIZE_N)
     # accumulator = tl.broadcast_to(accumulator[None, :],
     # (BLOCK_SIZE_M, BLOCK_SIZE_N))
     # accumulator = accumulator & 0x0
     # accumulator = accumulator.to(accumulator_dtype)
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=accumulator_dtype)
+    # Triton 3.7 no longer accepts bf16 as ``tl.dot(..., out_dtype=...)``.
+    # Accumulating in fp32 is also the numerically correct choice for W4A16;
+    # the result is cast back to the requested output dtype before storing.
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     # Create reverse AWQ order as tensor: [0, 4, 1, 5, 2, 6, 3, 7]
     # that will map given indices to the correct order.
@@ -215,7 +216,7 @@ def awq_gemm_kernel(
         b = b.to(c_ptr.type.element_ty)
 
         # Accumulate results.
-        accumulator = tl.dot(a, b, accumulator, out_dtype=accumulator_dtype)
+        accumulator = tl.dot(a, b, accumulator, out_dtype=tl.float32)
 
         offsets_k += BLOCK_SIZE_K * SPLIT_K
         a_ptrs += BLOCK_SIZE_K * SPLIT_K

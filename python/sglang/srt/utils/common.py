@@ -1054,6 +1054,15 @@ def is_gfx942_supported():
         return False
 
 
+@lru_cache(maxsize=1)
+def is_gfx1201_supported():
+    """Return whether the current ROCm device is Radeon RDNA4 gfx1201."""
+    if torch.version.hip:
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return "gfx1201" in gcn_arch
+    return False
+
+
 def get_hip_version():
     if torch.version.hip:
         return tuple(map(int, torch.version.hip.split("-")[0].split(".")))

@@ -1963,7 +1963,10 @@ def apply_fp8_linear(
                 weight,
                 out_dtype=output_dtype,
                 scale_a=x_scale,
-                scale_b=weight_scale.t(),
+                # A 1-D tensor is unchanged by .t(), but ROCm row-wise
+                # scaled_mm requires B's per-output-channel scale to be a
+                # contiguous (1, N) row.
+                scale_b=weight_scale.reshape(1, -1).contiguous(),
                 bias=bias,
             )
             return _process_scaled_mm_output(output, input_2d.shape, output_shape)

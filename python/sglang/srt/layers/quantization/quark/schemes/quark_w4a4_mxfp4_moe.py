@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from importlib.util import find_spec
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -43,12 +44,13 @@ _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 __all__ = ["QuarkW4A4MXFp4MoE"]
 
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_has_aiter = find_spec("aiter") is not None
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip and _has_aiter
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.utility.fp4_utils import e8m0_shuffle
 
-if _is_hip:
+if _is_hip and _has_aiter:
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
 else:
     dynamic_mxfp4_quant = None

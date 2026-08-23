@@ -16,6 +16,7 @@
 import os
 import platform
 import sys
+from importlib.util import find_spec
 from pathlib import Path
 
 import torch
@@ -24,6 +25,14 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 root = Path(__file__).parent.resolve()
 arch = platform.machine().lower()
+
+
+def _package_root(package_name):
+    """Return the root of a package shipped by the AMD ROCm PyTorch wheels."""
+    spec = find_spec(package_name)
+    if spec is None or spec.submodule_search_locations is None:
+        return None
+    return Path(next(iter(spec.submodule_search_locations)))
 
 
 def _get_version():
@@ -39,6 +48,14 @@ include_dirs = [
     root / "include" / "impl",
     root / "csrc",
 ]
+
+# AMD's multi-arch PyTorch wheels install the complete ROCm SDK in these
+# packages, while torch.utils.cpp_extension.ROCM_HOME can point at the smaller
+# system "core" component. Add the bundled SDK explicitly so headers such as
+# hipblas/hipblas.h are available when building against the wheel.
+rocm_sdk_devel_root = _package_root("_rocm_sdk_devel")
+if rocm_sdk_devel_root is not None:
+    include_dirs.append(rocm_sdk_devel_root / "include")
 
 sources = [
     "csrc/allreduce/custom_all_reduce.hip",
@@ -62,6 +79,13 @@ sources = [
 cxx_flags = ["-O3"]
 libraries = ["hiprtc", "amdhip64", "c10", "torch", "torch_python"]
 extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-linux-gnu"]
+if rocm_sdk_devel_root is not None:
+    extra_link_args.extend(
+        [
+            f"-L{rocm_sdk_devel_root / 'lib'}",
+            f"-Wl,-rpath,{rocm_sdk_devel_root / 'lib'}",
+        ]
+    )
 
 default_target = "gfx942"
 amdgpu_target = os.environ.get("AMDGPU_TARGET", default_target)
@@ -74,9 +98,10 @@ if torch.cuda.is_available():
 else:
     print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
 
-if amdgpu_target not in ["gfx942", "gfx950", "gfx1250"]:
+if amdgpu_target not in ["gfx942", "gfx950", "gfx1201", "gfx1250"]:
     print(
-        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942', 'gfx950', or 'gfx1250'."
+        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. "
+        "Expected 'gfx942', 'gfx950', 'gfx1201', or 'gfx1250'."
     )
     sys.exit(1)
 
@@ -87,8 +112,15 @@ fp8_macro = (
 # Dynamic shared-memory budget for the TopK kernels.
 # - gfx942 (MI300/MI325): LDS is typically 64KB per workgroup -> keep dynamic smem <= ~48KB
 #   (leaves room for static shared allocations in the kernel).
-# - gfx95x (MI350) and gfx1250: LDS is larger -> allow the original 128KB dynamic smem.
-topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" else 32 * 1024 * 4
+# - gfx1201 (R9700): use 64KB.
+# - gfx95x (MI350) and gfx1250: LDS is larger -> allow 128KB.
+topk_dynamic_smem_bytes = (
+    48 * 1024
+    if amdgpu_target == "gfx942"
+    else 64 * 1024
+    if amdgpu_target == "gfx1201"
+    else 128 * 1024
+)
 
 hipcc_flags = [
     "-DNDEBUG",

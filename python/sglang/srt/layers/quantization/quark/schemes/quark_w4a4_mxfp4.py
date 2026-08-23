@@ -2,6 +2,7 @@
 
 import logging
 import threading
+from importlib.util import find_spec
 from typing import Any, Callable, Optional
 
 import torch
@@ -28,7 +29,11 @@ from sglang.srt.utils.common import direct_register_custom_op, is_gfx95_supporte
 NVFP4_BLOCK_SIZE = 16
 
 _is_hip = is_hip()
-if _is_hip:
+# AITER is optional when ROCm is used without the AITER backend.  Importing it
+# unconditionally here prevented unrelated BF16 diffusion pipelines from even
+# reaching argument parsing on such systems (for example Radeon/gfx1201).
+_has_aiter = find_spec("aiter") is not None
+if _is_hip and _has_aiter:
     from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
         fused_gemm_afp4wfp4_split_cat as _fused_gemm_afp4wfp4_split_cat_orig,
     )
