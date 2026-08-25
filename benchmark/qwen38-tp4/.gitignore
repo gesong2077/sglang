@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.pickle
+*.log
+*.so
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.DS_Store
+profiles/
