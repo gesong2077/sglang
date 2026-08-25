@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import os
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -15,6 +17,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
@@ -40,6 +43,7 @@ from sglang.srt.utils.common import is_npu
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
+logger = logging.getLogger(__name__)
 
 if _is_cpu:
     from sgl_kernel import assign_draft_cache_locs_contiguous_cpu
@@ -585,6 +589,22 @@ def run_eagle_verify(
         accept_lens,
         accept_index,
     ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
+    if (
+        os.getenv("SGLANG_DEBUG_MTP_INPUTS", "0") == "1"
+        and get_parallel().tp_rank == 0
+        and not batch.forward_mode.is_idle()
+    ):
+        target_top1 = logits_output.next_token_logits.argmax(dim=-1)
+        logger.info(
+            "MTP_DEBUG verify draft_tokens=%s target_top1=%s predict=%s "
+            "accept_lens=%s accept_index=%s seq_lens=%s",
+            verify_input.draft_token.view(bs, -1).tolist(),
+            target_top1.view(bs, -1).tolist(),
+            predict.view(bs, -1).tolist(),
+            accept_lens.tolist(),
+            accept_index.tolist(),
+            batch.seq_lens.tolist(),
+        )
     new_seq_lens = batch.seq_lens + accept_lens
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),

@@ -31,7 +31,7 @@ def qr_rocm_arch_available():
     try:
         props = torch.cuda.get_device_properties(0)
         gcn_arch = getattr(props, "gcnArchName", "")
-        supported_archs = ["gfx94", "gfx95"]
+        supported_archs = ["gfx94", "gfx95", "gfx1200", "gfx1201"]
         return any(gfx in gcn_arch for gfx in supported_archs)
     except Exception as e:
         logger.warning("Failed to determine ROCm for quick allreduce: %s", e)
@@ -75,8 +75,7 @@ class QuickAllReduce:
         quantization formats and FP(float16, bfloat16).
         Quick allreduce is designed as a complement to custom allreduce.
         Its initialization requires even stricter conditions.
-        Only the ROCm MI300 series is supported for quick allreduce at
-        this time.
+        Supported ROCm families include CDNA3/CDNA4 and RDNA4.
         Args:
             group: the process group to work on. If None, it will use the
                 default process group.
@@ -89,7 +88,7 @@ class QuickAllReduce:
         self.disabled = True
         if not qr_rocm_arch_available():
             logger.debug(
-                "Custom quick allreduce is only supported on ROCm MI300 series."
+                "Custom quick allreduce is unsupported on this ROCm architecture."
             )
             return
 
@@ -196,7 +195,15 @@ class QuickAllReduce:
         # quickallreduce should not be created.
 
         # ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB is specified in MB
-        qr_max_size = int(os.environ.get("ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB", 0))
+        qr_max_size_env = os.environ.get("ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB")
+        if qr_max_size_env is None and "gfx12" in torch.cuda.get_device_properties(0).gcnArchName:
+            # TP2 gfx1201 measurements show a stable advantage through roughly
+            # 80-84 MiB, so leave headroom at 96 MiB for broad opt-in users.
+            # The Qwen launcher deliberately overrides this to 1 MiB so only
+            # the independently validated decode-sized messages use QR.
+            qr_max_size = 96
+        else:
+            qr_max_size = int(qr_max_size_env or 0)
         if qr_max_size > 0:
             if qr_max_size < 1:
                 logger.info(
@@ -209,6 +216,13 @@ class QuickAllReduce:
         self.qr_max_size = qr_max_size if qr_max_size > 0 else ops.qr_max_size()
         self.create_shared_buffer()
         self.disabled = False
+        logger.info(
+            "[AR] QuickReduce enabled: world_size=%d regime=%s max_size=%d bytes cast_bf16_to_fp16=%d",
+            self.world_size,
+            self.qr_quant_level.name,
+            self.qr_max_size,
+            self.use_fp16_kernels,
+        )
 
     def create_shared_buffer(self):
         """
@@ -239,10 +253,23 @@ class QuickAllReduce:
         dtype = inp.dtype
         if self.use_fp16_kernels:
             dtype = torch.float16
+        min_size = self._QR_MIN_SIZE[(dtype, self.world_size)][
+            self.qr_quant_level.value
+        ]
+        if (
+            self.world_size == 2
+            and self.qr_quant_level is QuickReduceRegime.FP
+            and "gfx12" in torch.cuda.get_device_properties(self.device).gcnArchName
+        ):
+            # TP2 Qwen decode reduces one [tokens, hidden_size] BF16 tensor per
+            # projection (10 KiB at tokens=1, hidden=5120). On gfx1201 the
+            # non-quantized QuickReduce path is graph-safe and materially faster
+            # than RCCL even at this size; the generic CDNA-derived 1/2-MiB
+            # floor otherwise excludes the entire decode workload.
+            min_size = 16
         return (
             inp_size <= self.qr_max_size
-            and inp_size
-            >= self._QR_MIN_SIZE[(dtype, self.world_size)][self.qr_quant_level.value]
+            and inp_size >= min_size
         )
 
     def quick_all_reduce(self, inp: torch.Tensor, *, out: torch.Tensor = None):

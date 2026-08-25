@@ -45,6 +45,7 @@ from sglang.srt.utils import (
     is_blackwell_supported,
     is_cuda,
     is_flashinfer_available,
+    is_gfx1201_supported,
     is_gfx95_supported,
     is_hip,
     is_musa,
@@ -64,10 +65,15 @@ _is_sm90_supported = is_sm90_supported()
 _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
 _is_gfx95_supported = is_gfx95_supported()
+_is_gfx1201_supported = is_gfx1201_supported()
 _is_musa = is_musa()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_aiter_available = False
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
+_rdna4_prefill_fp8_gemm_tuning = not get_bool_env_var(
+    "SGLANG_DISABLE_RDNA4_PREFILL_FP8_GEMM_TUNING", "False"
+)
 # ROCm 7.0 hipcc miscompiles gemm_a8w8_blockscale_bpreshuffle on gfx95 (#23319).
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
 # gfx95 + ROCm < 7.2: bpreshuffle CK is disabled (above), and the non-bpreshuffle
@@ -83,6 +89,330 @@ _AITER_GFX95_CK_W8A8_MAX_SAFE_M = {
     (4096, 2048): 2048,  # TP4 o_proj (TP8 shape was (4096, 1024))
     (4608, 4096): 512,  # TP4 attn qkv/gate proj: CK NaN at M>=2048 on ROCm 7.0
 }
+
+# Exact Qwen3.5/3.8 TP2 production shapes on gfx1201.  The generic AITER
+# blockscale table uses one large-M tile for four of these five GEMMs.  These
+# per-shape tiles were screened on R9700.  Exact rows remain useful for their
+# original production points; arbitrary prefill sizes are resolved to the
+# independently screened range table below instead of falling back to AITER's
+# substantially slower generic large-M tile.  All configurations preserve the
+# checkpoint's native 128x128 block-FP8 contract.
+_GFX1201_QWEN_TP2_PREFILL_FP8_CONFIGS = {
+    512: {
+        (17408, 5120): dict(
+            BLOCK_SIZE_M=64,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=128,
+            GROUP_SIZE_M=8,
+            NUM_KSPLIT=1,
+            num_warps=4,
+            num_stages=1,
+            matrix_instr_nonkdim=0,
+            waves_per_eu=2,
+            kpack=1,
+        ),
+        (7168, 5120): dict(
+            BLOCK_SIZE_M=64,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=128,
+            GROUP_SIZE_M=32,
+            NUM_KSPLIT=1,
+            num_warps=4,
+            num_stages=1,
+            matrix_instr_nonkdim=0,
+            waves_per_eu=2,
+        ),
+        (5120, 3072): dict(
+            BLOCK_SIZE_M=64,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=128,
+            GROUP_SIZE_M=8,
+            NUM_KSPLIT=1,
+            num_warps=4,
+            num_stages=1,
+            matrix_instr_nonkdim=0,
+            waves_per_eu=2,
+        ),
+        (5120, 8704): dict(
+            BLOCK_SIZE_M=64,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=128,
+            GROUP_SIZE_M=8,
+            NUM_KSPLIT=1,
+            num_warps=4,
+            num_stages=2,
+            matrix_instr_nonkdim=16,
+            waves_per_eu=1,
+            kpack=2,
+        ),
+        (8192, 5120): dict(
+            BLOCK_SIZE_M=128,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=128,
+            GROUP_SIZE_M=32,
+            NUM_KSPLIT=1,
+            num_warps=8,
+            num_stages=1,
+            matrix_instr_nonkdim=0,
+            waves_per_eu=0,
+        ),
+    },
+    1024: {
+        (17408, 5120): dict(
+            BLOCK_SIZE_M=64,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=128,
+            GROUP_SIZE_M=8,
+            NUM_KSPLIT=1,
+            num_warps=4,
+            num_stages=2,
+            matrix_instr_nonkdim=0,
+            waves_per_eu=1,
+            kpack=1,
+        ),
+        (7168, 5120): dict(
+            BLOCK_SIZE_M=64,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=128,
+            GROUP_SIZE_M=32,
+            NUM_KSPLIT=1,
+            num_warps=4,
+            num_stages=1,
+            matrix_instr_nonkdim=0,
+            waves_per_eu=2,
+        ),
+        (5120, 3072): dict(
+            BLOCK_SIZE_M=64,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=128,
+            GROUP_SIZE_M=8,
+            NUM_KSPLIT=1,
+            num_warps=4,
+            num_stages=1,
+            matrix_instr_nonkdim=0,
+            waves_per_eu=2,
+        ),
+        (5120, 8704): dict(
+            BLOCK_SIZE_M=64,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=128,
+            GROUP_SIZE_M=8,
+            NUM_KSPLIT=1,
+            num_warps=4,
+            num_stages=2,
+            matrix_instr_nonkdim=16,
+            waves_per_eu=1,
+            kpack=2,
+        ),
+        (8192, 5120): dict(
+            BLOCK_SIZE_M=128,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=128,
+            GROUP_SIZE_M=32,
+            NUM_KSPLIT=1,
+            num_warps=8,
+            num_stages=1,
+            matrix_instr_nonkdim=0,
+            waves_per_eu=0,
+        ),
+    },
+    4096: {
+        (17408, 5120): dict(
+            BLOCK_SIZE_M=64,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=128,
+            GROUP_SIZE_M=32,
+            NUM_KSPLIT=1,
+            num_warps=4,
+            num_stages=2,
+            matrix_instr_nonkdim=0,
+            waves_per_eu=1,
+        ),
+        (7168, 5120): dict(
+            BLOCK_SIZE_M=64,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=128,
+            GROUP_SIZE_M=8,
+            NUM_KSPLIT=1,
+            num_warps=4,
+            num_stages=1,
+        ),
+        (5120, 3072): dict(
+            BLOCK_SIZE_M=64,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=128,
+            GROUP_SIZE_M=8,
+            NUM_KSPLIT=1,
+            num_warps=4,
+            num_stages=1,
+        ),
+        (5120, 8704): dict(
+            BLOCK_SIZE_M=64,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=128,
+            GROUP_SIZE_M=8,
+            NUM_KSPLIT=1,
+            num_warps=4,
+            num_stages=2,
+            matrix_instr_nonkdim=0,
+            waves_per_eu=1,
+        ),
+        (8192, 5120): dict(
+            BLOCK_SIZE_M=64,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=128,
+            GROUP_SIZE_M=8,
+            NUM_KSPLIT=1,
+            num_warps=4,
+            num_stages=1,
+        ),
+    },
+    4608: {
+        (17408, 5120): dict(
+            BLOCK_SIZE_M=64,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=128,
+            GROUP_SIZE_M=8,
+            NUM_KSPLIT=1,
+            num_warps=4,
+            num_stages=2,
+            matrix_instr_nonkdim=16,
+            waves_per_eu=1,
+        ),
+        (7168, 5120): dict(
+            BLOCK_SIZE_M=64,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=128,
+            GROUP_SIZE_M=8,
+            NUM_KSPLIT=1,
+            num_warps=4,
+            num_stages=1,
+        ),
+        (5120, 3072): dict(
+            BLOCK_SIZE_M=128,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=128,
+            GROUP_SIZE_M=8,
+            NUM_KSPLIT=1,
+            num_warps=8,
+            num_stages=1,
+            matrix_instr_nonkdim=16,
+            waves_per_eu=0,
+        ),
+        (5120, 8704): dict(
+            BLOCK_SIZE_M=64,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=128,
+            GROUP_SIZE_M=8,
+            NUM_KSPLIT=1,
+            num_warps=4,
+            num_stages=2,
+            matrix_instr_nonkdim=16,
+            waves_per_eu=1,
+            kpack=1,
+        ),
+        (8192, 5120): dict(
+            BLOCK_SIZE_M=128,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=128,
+            GROUP_SIZE_M=8,
+            NUM_KSPLIT=1,
+            num_warps=8,
+            num_stages=1,
+            matrix_instr_nonkdim=0,
+            waves_per_eu=0,
+        ),
+    },
+    8192: {
+        (17408, 5120): dict(
+            BLOCK_SIZE_M=64,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=128,
+            GROUP_SIZE_M=32,
+            NUM_KSPLIT=1,
+            num_warps=4,
+            num_stages=2,
+            matrix_instr_nonkdim=16,
+            waves_per_eu=1,
+        ),
+        (7168, 5120): dict(
+            BLOCK_SIZE_M=64,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=128,
+            GROUP_SIZE_M=8,
+            NUM_KSPLIT=1,
+            num_warps=4,
+            num_stages=1,
+            waves_per_eu=1,
+        ),
+        (5120, 3072): dict(
+            BLOCK_SIZE_M=64,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=128,
+            GROUP_SIZE_M=32,
+            NUM_KSPLIT=1,
+            num_warps=4,
+            num_stages=2,
+            waves_per_eu=1,
+        ),
+        (5120, 8704): dict(
+            BLOCK_SIZE_M=64,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=128,
+            GROUP_SIZE_M=8,
+            NUM_KSPLIT=1,
+            num_warps=4,
+            num_stages=2,
+            matrix_instr_nonkdim=16,
+            waves_per_eu=1,
+        ),
+        (8192, 5120): dict(
+            BLOCK_SIZE_M=128,
+            BLOCK_SIZE_N=128,
+            BLOCK_SIZE_K=128,
+            GROUP_SIZE_M=8,
+            NUM_KSPLIT=1,
+            num_warps=8,
+            num_stages=1,
+            matrix_instr_nonkdim=16,
+            waves_per_eu=0,
+        ),
+    },
+}
+
+
+# Range selectors for non-tabulated M.  The entries point at configurations in
+# the exact table above so there is one source of truth for every kernel tile.
+# Screening used non-power-of-two M values across the full 64..8192 scheduler
+# domain and a separate set of holdout values.  Do not use the range path for
+# M<=8: those are decode/speculative-verification shapes with dedicated paths.
+_GFX1201_QWEN_TP2_DYNAMIC_PREFILL_FP8_CONFIG_SOURCES = {
+    (17408, 5120): ((4608, 4608), (8192, 1024)),
+    (7168, 5120): ((2048, 512), (8192, 8192)),
+    (5120, 3072): ((8192, 8192),),
+    (5120, 8704): ((1024, 8192), (4608, 512), (8192, 8192)),
+    (8192, 5120): ((8192, 4096),),
+}
+
+
+def _resolve_gfx1201_qwen_tp2_prefill_fp8_config(
+    m: int, n: int, k: int
+) -> Optional[dict]:
+    exact_config = _GFX1201_QWEN_TP2_PREFILL_FP8_CONFIGS.get(m, {}).get((n, k))
+    if exact_config is not None:
+        return exact_config
+
+    # The TP2 server caps each prefill forward at 8192 tokens.  Values below
+    # 64 are intentionally left to the generic path because they overlap with
+    # small continuous-batching/verification workloads, not throughput prefill.
+    if not 64 <= m <= 8192:
+        return None
+    for max_m, source_m in _GFX1201_QWEN_TP2_DYNAMIC_PREFILL_FP8_CONFIG_SOURCES.get(
+        (n, k), ()
+    ):
+        if m <= max_m:
+            return _GFX1201_QWEN_TP2_PREFILL_FP8_CONFIGS[source_m][(n, k)]
+    return None
 
 
 class _MXFP4QuantizedData(MXFP4QuantizeUtil):
@@ -157,19 +487,28 @@ def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
     ]
 
 
-if _use_aiter:
-    import aiter
-    from aiter import gemm_a8w8_blockscale as ck_gemm_a8w8_blockscale
-    from aiter import (
-        gemm_a8w8_blockscale_bpreshuffle,
-        gemm_a8w8_bpreshuffle,
-        get_hip_quant,
-    )
-    from aiter.ops.triton.gemm_a8w8_blockscale import (
-        gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
-    )
+if _is_hip:
+    try:
+        import aiter
+        from aiter import gemm_a8w8_blockscale as ck_gemm_a8w8_blockscale
+        from aiter import (
+            gemm_a8w8_blockscale_bpreshuffle,
+            gemm_a8w8_bpreshuffle,
+            get_hip_quant,
+        )
+        from aiter.ops.triton.gemm_a8w8_blockscale import (
+            gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
+        )
 
-    aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
+        aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
+        _aiter_available = True
+    except ImportError:
+        pass
+
+    if _is_gfx1201_supported:
+        from sglang.kernels.ops.gemm.rdna4_fp8_skinny import (
+            rdna4_fp8_blockwise_skinny,
+        )
 
 
 if _is_cuda:
@@ -714,11 +1053,10 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
         return cutlass_w8a8_block_fp8_linear_with_fallback
 
     elif backend.is_aiter():
-        if not _use_aiter:
+        if not _aiter_available:
             raise RuntimeError(
                 "AITER backend requested via --fp8-gemm-backend=aiter, "
-                "but AITER is not available. AITER requires AMD GPUs with "
-                "SGLANG_USE_AITER=1 environment variable set."
+                "but AITER is not installed or could not be imported."
             )
         return aiter_w8a8_block_fp8_linear
 
@@ -1173,6 +1511,86 @@ def aiter_w8a8_block_fp8_linear(
         )
         if materialize_bpreshuffle_scale:
             x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
+
+    if (
+        _is_gfx1201_supported
+        and input_2d.shape[0] == 1
+        and q_input.dtype == torch.float8_e4m3fn
+        and weight.dtype == torch.float8_e4m3fn
+        and x_scale.is_contiguous()
+        and weight_scale.is_contiguous()
+    ):
+        output = rdna4_fp8_blockwise_skinny(
+            q_input, weight, x_scale, weight_scale
+        )
+        if bias is not None:
+            output += bias
+        return output.view(*output_shape)
+
+    if (
+        _is_gfx1201_supported
+        and 1 < input_2d.shape[0] <= 8
+        and q_input.dtype == torch.float8_e4m3fn
+        and weight.dtype == torch.float8_e4m3fn
+        and x_scale.is_contiguous()
+        and weight_scale.is_contiguous()
+    ):
+        # AITER's Triton block-FP8 GEMM can select an invalid small-M config on
+        # gfx1201 for real Qwen3.5 weights/scales (notably M=2, N=5120,
+        # K=4352): finite SiLU activations are amplified by ~1e4 and the next
+        # layer becomes NaN.  SGLang's block-FP8 kernel uses the same 1x128
+        # scale contract and is stable for the speculative-verify domain.
+        # Keep the faster RDNA4 skinny kernel for M=1 and AITER for long
+        # prefill; only route the small multi-token gap through this fallback.
+        output = w8a8_block_fp8_matmul_triton(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            block_size,
+            output_dtype=(
+                torch.bfloat16 if input_scale is not None else input_2d.dtype
+            ),
+        )
+        if bias is not None:
+            output += bias
+        return output.view(*output_shape)
+
+    rdna4_prefill_config = _resolve_gfx1201_qwen_tp2_prefill_fp8_config(
+        input_2d.shape[0], n, k
+    )
+    if (
+        _rdna4_prefill_fp8_gemm_tuning
+        and _is_gfx1201_supported
+        and rdna4_prefill_config is not None
+        and block_size == [128, 128]
+        and q_input.dtype == torch.float8_e4m3fn
+        and weight.dtype == torch.float8_e4m3fn
+        and x_scale.dtype == torch.float32
+        and weight_scale.dtype == torch.float32
+        and q_input.is_contiguous()
+        and weight.is_contiguous()
+        and x_scale.is_contiguous()
+        and weight_scale.is_contiguous()
+    ):
+        sglang_prefill_config = rdna4_prefill_config.copy()
+        sglang_prefill_config.pop("NUM_KSPLIT")
+        output = w8a8_block_fp8_matmul_triton(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            block_size,
+            output_dtype=(
+                torch.bfloat16 if input_scale is not None else input.dtype
+            ),
+            config_override=sglang_prefill_config,
+        )
+        if bias is not None:
+            output += bias
+        return output.to(
+            dtype=torch.bfloat16 if input_scale is not None else input_2d.dtype
+        ).view(*output_shape)
 
     if use_triton:
         gemm_a8w8_blockscale_op = triton_gemm_a8w8_blockscale

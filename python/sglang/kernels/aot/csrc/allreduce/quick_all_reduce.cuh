@@ -502,13 +502,13 @@ struct AllReduceTwoshot {
       uint8_t** __restrict__ buffer_list,  // communication buffers
       uint32_t const data_offset,          // offset to start of the data buffer
       uint32_t flag_color,
+      bool graph_mode,
       int64_t data_size_per_phase) {
     // Topology
     int thread = threadIdx.x + threadIdx.y * kWavefront;
     uint8_t* rank_buffer = buffer_list[rank];
     Codec codec(thread, rank);
     int block_id = blockIdx.x;
-    int grid_size = gridDim.x;
     // --------------------------------------------------------
     // Read input into registers
     int32x4_t tA[kAtoms];
@@ -517,7 +517,16 @@ struct AllReduceTwoshot {
     uint32_t src_offset = block * kTileSize + thread * sizeof(int32x4_t);
 
     for (int i = 0; i < kAtoms; i++) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+      if (src_offset < N * sizeof(T)) {
+        tA[i] = *reinterpret_cast<const int32x4_t*>(
+            reinterpret_cast<const uint8_t*>(input) + src_offset);
+      } else {
+        tA[i] = {};
+      }
+#else
       tA[i] = buffer_load_dwordx4(src_buffer.descriptor, src_offset, 0, 0);
+#endif
       src_offset += kAtomStride * sizeof(int32x4_t);
       if constexpr (cast_bf2half) {
         const nv_bfloat162* bf_buf = reinterpret_cast<const nv_bfloat162*>(&tA[i]);
@@ -537,8 +546,10 @@ struct AllReduceTwoshot {
     uint32_t comm_data0_offset = data_offset + block_id * Codec::kTransmittedTileSize;
     uint32_t comm_data1_offset = data_size_per_phase + comm_data0_offset;
 
-    uint32_t comm_flags0_offset = block_id * (kWorldSize * sizeof(uint32_t));
-    uint32_t comm_flags1_offset = (data_offset / 2) + comm_flags0_offset;
+    constexpr uint32_t kFlagsBankSize = kWorldSize * kMaxNumBlocks * sizeof(uint32_t);
+    const uint32_t flags_pair_offset = graph_mode ? 2 * kFlagsBankSize : 0;
+    uint32_t comm_flags0_offset = flags_pair_offset + block_id * (kWorldSize * sizeof(uint32_t));
+    uint32_t comm_flags1_offset = kFlagsBankSize + comm_flags0_offset;
 
     for (int r = 0; r < kWorldSize; r++) {
       int32x4_t* send_buffer =
@@ -614,6 +625,12 @@ struct AllReduceTwoshot {
     uint32_t dst_offset = block * kTileSize + thread * sizeof(int32x4_t);
 
     for (int i = 0; i < kAtoms; i++) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+      if (dst_offset >= N * sizeof(T)) {
+        dst_offset += kAtomStride * sizeof(int32x4_t);
+        continue;
+      }
+#endif
       if constexpr (cast_bf2half) {
         const half2* half_buf = reinterpret_cast<const half2*>(&tA[i]);
         nv_bfloat162 bf16_buf[4];
@@ -622,9 +639,18 @@ struct AllReduceTwoshot {
           float2 f = __half22float2(half_buf[j]);
           bf16_buf[j] = __float22bfloat162_rn(f);
         }
-        buffer_store_dwordx4(*reinterpret_cast<const int32x4_t*>(bf16_buf), dst_buffer.descriptor, dst_offset, 0, 0);
+        const int32x4_t value = *reinterpret_cast<const int32x4_t*>(bf16_buf);
+#if defined(__gfx1200__) || defined(__gfx1201__)
+        *reinterpret_cast<int32x4_t*>(reinterpret_cast<uint8_t*>(output) + dst_offset) = value;
+#else
+        buffer_store_dwordx4(value, dst_buffer.descriptor, dst_offset, 0, 0);
+#endif
       } else {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+        *reinterpret_cast<int32x4_t*>(reinterpret_cast<uint8_t*>(output) + dst_offset) = tA[i];
+#else
         buffer_store_dwordx4(tA[i], dst_buffer.descriptor, dst_offset, 0, 0);
+#endif
       }
       dst_offset += kAtomStride * sizeof(int32x4_t);
     }

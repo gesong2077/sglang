@@ -15,6 +15,7 @@
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
 import logging
+import os
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
@@ -109,6 +110,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_gfx1201_supported,
     is_gfx95_supported,
     is_hip,
     is_npu,
@@ -124,6 +126,7 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_gfx95 = is_gfx95_supported()
+_is_gfx1201 = is_gfx1201_supported()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -134,7 +137,37 @@ _gdn_use_alt_stream = _is_cuda or (
 _qknorm_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
 )
+_rdna4_rms_quant = not get_bool_env_var(
+    "SGLANG_DISABLE_RDNA4_RMS_QUANT", "False"
+)
+_rdna4_fused_act_quant = not get_bool_env_var(
+    "SGLANG_DISABLE_RDNA4_FUSED_ACT_QUANT", "False"
+)
+_rdna4_prefill_rms_quant = not get_bool_env_var(
+    "SGLANG_DISABLE_RDNA4_PREFILL_RMS_QUANT", "False"
+)
+_rdna4_prefill_output_quant = not get_bool_env_var(
+    "SGLANG_DISABLE_RDNA4_PREFILL_OUTPUT_QUANT", "False"
+)
 _is_amx_available = cpu_has_amx_support()
+
+if _is_gfx1201:
+    import aiter
+
+    from aiter.ops.triton.activation import (
+        act_mul_and_fp8_group_quant as _rdna4_act_mul_and_fp8_group_quant,
+    )
+    from aiter.ops.triton.quant.fused_fp8_quant import (
+        fused_rms_fp8_group_quant as _rdna4_fused_rms_fp8_group_quant,
+        fused_rms_gated_fp8_group_quant as _rdna4_fused_rms_gated_fp8_group_quant,
+        fused_sigmoid_mul_fp8_group_quant as _rdna4_fused_sigmoid_mul_fp8_group_quant,
+    )
+
+    from sglang.kernels.ops.gemm.rdna4_fp8_skinny import (
+        rdna4_gdn_dual_projection,
+    )
+
+    _rdna4_gdn_quant = aiter.get_hip_quant(aiter.QuantType.per_1x128)
 
 # Head-group ratios (num_v_heads // num_k_heads) served by the fused
 # split/reshape/cat Triton kernel. On AMD/aiter the ratio-8 layout is also
@@ -203,6 +236,28 @@ def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
     )
 
 
+def _is_rdna4_qwen35_output_projection(linear: nn.Module) -> bool:
+    """Validate the TP2/TP4 Qwen3.8 output block-FP8 layouts."""
+    method = getattr(linear, "quant_method", None)
+    weight = getattr(linear, "weight", None)
+    weight_scale = getattr(linear, "weight_scale_inv", None)
+    local_k = weight.shape[1] if weight is not None and weight.ndim == 2 else -1
+    return bool(
+        _is_gfx1201
+        and getattr(method, "block_quant", False)
+        and tuple(getattr(method, "weight_block_size", ())) == (128, 128)
+        and weight is not None
+        and tuple(weight.shape) in ((5120, 1536), (5120, 3072))
+        and weight.dtype == torch.float8_e4m3fn
+        and weight.is_contiguous()
+        and weight_scale is not None
+        and tuple(weight_scale.shape) == (40, local_k // 128)
+        and weight_scale.dtype == torch.float32
+        and weight_scale.is_contiguous()
+        and getattr(linear, "bias", None) is None
+    )
+
+
 def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
     if not isinstance(hidden_states, tuple):
         return hidden_states
@@ -216,6 +271,136 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
     raise TypeError(
         f"{linear.__class__.__name__} cannot consume fused AR quant tuple input"
     )
+
+
+def _hidden_states_num_tokens(hidden_states) -> int:
+    """Return the token dimension for Tensor or fused-AR tuple inputs."""
+    tensor = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+    return tensor.shape[0]
+
+
+class _Qwen35Rdna4FusedGemmaRMSNorm(GemmaRMSNorm):
+    """Gemma RMSNorm with a block-FP8 side output for gfx1201.
+
+    Qwen3.5/3.8 immediately feeds each decoder RMSNorm into a block-FP8
+    projection. Producing the normalized activation and its per-1x128 FP8
+    representation together removes the following standalone quant launch.
+    The prefill specialization is capped at the serving chunk size so larger
+    or unexpected batches retain the generic path. Set
+    ``SGLANG_DISABLE_RDNA4_PREFILL_RMS_QUANT=1`` for an A/B fallback while
+    preserving the independently validated M=1 decode specialization.
+    """
+
+    def __init__(self, hidden_size: int, eps: float, keep_bf16: bool) -> None:
+        super().__init__(hidden_size, eps=eps)
+        self.keep_bf16 = keep_bf16
+
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ):
+        if (
+            _rdna4_rms_quant
+            and _is_gfx1201
+            and x.ndim == 2
+            and x.shape[1] == 5120
+            and (
+                x.shape[0] == 1
+                or (_rdna4_prefill_rms_quant and 1 < x.shape[0] <= 8192)
+            )
+            and x.dtype == torch.bfloat16
+            and x.is_contiguous()
+            and (residual is None or residual.is_contiguous())
+            and post_residual_addition is None
+        ):
+            (fp8_out, scale_out), bf16_out, _, residual_out = (
+                _rdna4_fused_rms_fp8_group_quant(
+                    x,
+                    self.gemma_weight,
+                    self.variance_epsilon,
+                    group_size=128,
+                    dtype_quant=torch.float8_e4m3fn,
+                    res1=residual,
+                    output_unquantized_inp1=self.keep_bf16,
+                    transpose_scale=False,
+                    round_output_to_input_dtype=x.shape[0] > 1,
+                )
+            )
+            hidden_out = (
+                (bf16_out, fp8_out, scale_out)
+                if self.keep_bf16
+                else (fp8_out, scale_out)
+            )
+            if residual is None:
+                return hidden_out
+            return hidden_out, residual_out
+
+        return super().forward_hip(x, residual, post_residual_addition)
+
+
+class _Qwen35Rdna4FusedMLP(Qwen2MoeMLP):
+    """Fuse small-token SiLU-and-mul with down-projection FP8 quantization.
+
+    The M<=8 range covers decode and MTP target verification.  Qwen3.5-27B
+    uses a 17,408-wide intermediate, so the local down-projection K dimension
+    is 8,704 at TP2 and 4,352 at TP4.  Larger prefill batches and all other
+    models use the upstream MLP.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._rdna4_fused_act_quant_enabled = LazyValue(
+            self._can_use_rdna4_fused_act_quant
+        )
+
+    def _can_use_rdna4_fused_act_quant(self) -> bool:
+        method = getattr(self.down_proj, "quant_method", None)
+        weight = getattr(self.down_proj, "weight", None)
+        weight_scale = getattr(self.down_proj, "weight_scale_inv", None)
+        weight_shape = tuple(weight.shape) if weight is not None else ()
+        expected_scale_shape = (
+            (40, weight_shape[1] // 128)
+            if weight_shape in ((5120, 4352), (5120, 8704))
+            else ()
+        )
+        return bool(
+            _is_gfx1201
+            and _rdna4_fused_act_quant
+            and getattr(method, "block_quant", False)
+            and tuple(getattr(method, "weight_block_size", ())) == (128, 128)
+            and weight is not None
+            and weight_shape in ((5120, 4352), (5120, 8704))
+            and weight.dtype == torch.float8_e4m3fn
+            and weight.is_contiguous()
+            and weight_scale is not None
+            and tuple(weight_scale.shape) == expected_scale_shape
+            and weight_scale.dtype == torch.float32
+            and weight_scale.is_contiguous()
+            and getattr(self.down_proj, "bias", None) is None
+        )
+
+    def forward(self, x):
+        gate_up, _ = self.gate_up_proj(x)
+        if (
+            self._rdna4_fused_act_quant_enabled.value
+            and gate_up.ndim == 2
+            and 1 <= gate_up.shape[0] <= 8
+            and gate_up.shape[1] == self.down_proj.weight.shape[1] * 2
+            and gate_up.dtype == torch.bfloat16
+            and gate_up.is_contiguous()
+        ):
+            x = _rdna4_act_mul_and_fp8_group_quant(
+                gate_up,
+                activation="silu",
+                group_size=128,
+                dtype_quant=torch.float8_e4m3fn,
+            )
+        else:
+            x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
 
 
 if _is_npu:
@@ -309,6 +494,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 and use_intel_amx_backend(self.in_proj_ba)
             )
         )
+        self._rdna4_gdn_dual_projection_enabled = LazyValue(
+            self._can_use_rdna4_gdn_dual_projection
+        )
 
         # Conv1d weight loader setup
         query_key_settings = (self.key_dim, 0, False)
@@ -381,6 +569,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tp_size=self.attn_tp_size,
             prefix=add_prefix("out_proj", prefix),
         )
+        self._rdna4_fused_output_quant_enabled = LazyValue(
+            self._can_use_rdna4_fused_output_quant
+        )
 
     @staticmethod
     def _override_weight_loader(param, loader):
@@ -415,6 +606,62 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 continue
             wrapped_loader = self._make_packed_weight_loader(module, original_loader)
             self._override_weight_loader(param, wrapped_loader)
+
+    def _can_use_rdna4_gdn_dual_projection(self) -> bool:
+        """Validate the exact gfx1201 Qwen3.5/3.8-27B TP2/TP4 contract."""
+        q_method = getattr(self.in_proj_qkvz, "quant_method", None)
+        q_weight = getattr(self.in_proj_qkvz, "weight", None)
+        q_scale = getattr(self.in_proj_qkvz, "weight_scale_inv", None)
+        ba_weight = getattr(self.in_proj_ba, "weight", None)
+        projection_shape = (
+            self.attn_tp_size,
+            tuple(q_weight.shape) if q_weight is not None else (),
+            tuple(q_scale.shape) if q_scale is not None else (),
+            tuple(ba_weight.shape) if ba_weight is not None else (),
+        )
+        return bool(
+            _is_gfx1201
+            and projection_shape
+            in (
+                (2, (8192, 5120), (64, 40), (48, 5120)),
+                (4, (4096, 5120), (32, 40), (24, 5120)),
+            )
+            and self.hidden_size == 5120
+            and self.num_k_heads == 16
+            and self.num_v_heads == 48
+            and self.head_k_dim == 128
+            and self.head_v_dim == 128
+            and getattr(q_method, "block_quant", False)
+            and tuple(getattr(q_method, "weight_block_size", ())) == (128, 128)
+            and q_weight is not None
+            and q_weight.dtype == torch.float8_e4m3fn
+            and q_weight.is_contiguous()
+            and q_scale is not None
+            and q_scale.dtype == torch.float32
+            and q_scale.is_contiguous()
+            and getattr(self.in_proj_qkvz, "bias", None) is None
+            and type(getattr(self.in_proj_ba, "quant_method", None)).__name__
+            == "UnquantizedLinearMethod"
+            and ba_weight is not None
+            and ba_weight.dtype == torch.bfloat16
+            and ba_weight.is_contiguous()
+            and getattr(self.in_proj_ba, "bias", None) is None
+        )
+
+    def _can_use_rdna4_fused_output_quant(self) -> bool:
+        return bool(
+            self.attn_tp_size in (2, 4)
+            and self.hidden_size == 5120
+            and self.num_v_heads == 48
+            and self.head_v_dim == 128
+            and self.output_gate_type in ("silu", "swish")
+            and self.norm.group_size is None
+            and self.norm.norm_before_gate
+            and self.norm.bias is None
+            and tuple(self.norm.weight.shape) == (128,)
+            and self.norm.weight.dtype == torch.bfloat16
+            and _is_rdna4_qwen35_output_projection(self.out_proj)
+        )
 
     @staticmethod
     def _get_split_sizes_for_param(module, param, loaded_shard_id):
@@ -556,8 +803,32 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # consume ``(fp8, scale)`` (skipping its internal quant) while the
         # bf16 ``in_proj_ba`` consumes the unquantized bf16. Non-aiter runs skip
         # the tuple branch and keep the original control flow below unchanged.
-        if _use_aiter and isinstance(hidden_states, tuple):
+        if (_use_aiter or _is_gfx1201) and isinstance(hidden_states, tuple):
             return self._forward_input_proj_fused_quant_amd(hidden_states)
+
+        # Decode-only exact specialization for Qwen3.5/3.8-27B TP2/TP4 on R9700.
+        # It preserves the existing AITER per-1x128 activation quantization and
+        # fuses the block-FP8 qkvz GEMV with the tiny BF16 ba GEMV. Prefill and
+        # every non-matching model/backend continue through the generic path.
+        if (
+            self._rdna4_gdn_dual_projection_enabled.value
+            and hidden_states.shape == (1, 5120)
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.is_contiguous()
+        ):
+            q_activation, q_activation_scale = _rdna4_gdn_quant(
+                hidden_states,
+                quant_dtype=aiter.dtypes.fp8,
+                transpose_scale=False,
+            )
+            return rdna4_gdn_dual_projection(
+                hidden_states,
+                q_activation,
+                self.in_proj_qkvz.weight,
+                q_activation_scale,
+                self.in_proj_qkvz.weight_scale_inv,
+                self.in_proj_ba.weight,
+            )
 
         if (
             _is_cpu
@@ -606,6 +877,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         hs_qkvz = _select_fused_ar_input_for_linear(hidden_states, self.in_proj_qkvz)
         seq_len = hs_bf16.shape[0]
 
+        if (
+            self._rdna4_gdn_dual_projection_enabled.value
+            and seq_len == 1
+            and len(hidden_states) == 3
+        ):
+            return rdna4_gdn_dual_projection(
+                hs_bf16,
+                hidden_states[1],
+                self.in_proj_qkvz.weight,
+                hidden_states[2],
+                self.in_proj_qkvz.weight_scale_inv,
+                self.in_proj_ba.weight,
+            )
+
         if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
             DUAL_STREAM_TOKEN_THRESHOLD = 0
         else:
@@ -643,7 +928,29 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        if (
+        if _is_hip and projected_states_qkvz.shape[0] == 1:
+            # Qwen3.5 stores both merged projections in their final logical
+            # order: [q | k | v | z] and [b | a].  Keep strided views here
+            # instead of copying q/k/v and concatenating them back together,
+            # or materializing b/a.  Both the packed decode kernel and the
+            # single-token decode kernels consume the real row strides.
+            #
+            # Multi-token prefill and target verification are different: their
+            # convolution/chunk/recurrent kernels require dense token rows for
+            # q/k/v and a/b.  A [qkv|z] or [b|a] view is harmless for M=1 but
+            # feeds following tokens through a packed-projection row gap in at
+            # least one of those kernels, corrupting both the output and the
+            # cached GDN state.  Use the fused dense splitter below for every
+            # M>1 call while preserving the zero-copy decode path.
+            qkv_dim = (self.key_dim * 2 + self.value_dim) // self.attn_tp_size
+            z_dim = self.value_dim // self.attn_tp_size
+            ba_dim = self.num_v_heads // self.attn_tp_size
+            mixed_qkv, z = projected_states_qkvz.split(
+                [qkv_dim, z_dim], dim=-1
+            )
+            z = z.reshape(z.size(0), -1, self.head_v_dim)
+            b, a = projected_states_ba.split([ba_dim, ba_dim], dim=-1)
+        elif (
             self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
             and not _is_npu
         ):
@@ -691,14 +998,81 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.reshape(
-            *core_attn_out.shape[:-2],
-            core_attn_out.shape[-2] * core_attn_out.shape[-1],
-        )
+        num_tokens = z_shape_og[0]
+        local_v_heads = self.num_v_heads // self.attn_tp_size
+        if (
+            self._rdna4_fused_output_quant_enabled.value
+            and (
+                1 <= num_tokens <= 8
+                or (_rdna4_prefill_output_quant and 8 < num_tokens <= 8192)
+            )
+            and core_attn_out.shape == (num_tokens * local_v_heads, 128)
+            and z.shape == (num_tokens * local_v_heads, 128)
+            and core_attn_out.dtype == torch.bfloat16
+            and z.dtype == torch.bfloat16
+            and core_attn_out.is_contiguous()
+            and z.is_contiguous()
+        ):
+            core_attn_out, output_scale = _rdna4_fused_rms_gated_fp8_group_quant(
+                core_attn_out,
+                self.norm.weight,
+                None,
+                z,
+                self.norm.eps,
+                norm_before_gate=True,
+                activation=self.output_gate_type,
+                out_dtype=torch.float8_e4m3fn,
+                fp8_min_scaling_factor=1e-10 / 448.0,
+                group_size=128,
+                round_output_to_input_dtype=True,
+            )
+            core_attn_out = (
+                core_attn_out.reshape(num_tokens, local_v_heads * 128),
+                output_scale.reshape(num_tokens, local_v_heads),
+            )
+        else:
+            debug_mtp_output = (
+                os.environ.get("SGLANG_DEBUG_MTP_INPUTS", "0") == "1"
+                and self.layer_id == 0
+                and forward_batch.forward_mode.is_target_verify()
+            )
+            if debug_mtp_output:
+                logger.info(
+                    "MTP_DEBUG gdn0 output_gate_input core_finite=%s core_norms=%s "
+                    "z_finite=%s z_norms=%s core_stride=%s z_stride=%s",
+                    torch.isfinite(core_attn_out).view(z_shape_og[0], -1).all(1).tolist(),
+                    core_attn_out.float().view(z_shape_og[0], -1).norm(dim=-1).tolist(),
+                    torch.isfinite(z).view(z_shape_og[0], -1).all(1).tolist(),
+                    z.float().view(z_shape_og[0], -1).norm(dim=-1).tolist(),
+                    core_attn_out.stride(),
+                    z.stride(),
+                )
+            core_attn_out = self.norm(core_attn_out, z)
+            core_attn_out = core_attn_out.reshape(z_shape_og)
+            core_attn_out = core_attn_out.reshape(
+                *core_attn_out.shape[:-2],
+                core_attn_out.shape[-2] * core_attn_out.shape[-1],
+            )
+            if debug_mtp_output:
+                logger.info(
+                    "MTP_DEBUG gdn0 output_gate_output finite=%s norms=%s stride=%s",
+                    torch.isfinite(core_attn_out).view(z_shape_og[0], -1).all(1).tolist(),
+                    core_attn_out.float().view(z_shape_og[0], -1).norm(dim=-1).tolist(),
+                    core_attn_out.stride(),
+                )
 
         output, _ = self.out_proj(core_attn_out)
+        if (
+            os.environ.get("SGLANG_DEBUG_MTP_INPUTS", "0") == "1"
+            and self.layer_id == 0
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            logger.info(
+                "MTP_DEBUG gdn0 out_proj finite=%s norms=%s stride=%s",
+                torch.isfinite(output).view(z_shape_og[0], -1).all(1).tolist(),
+                output.float().view(z_shape_og[0], -1).norm(dim=-1).tolist(),
+                output.stride(),
+            )
         return output
 
 
@@ -742,7 +1116,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             is_previous_layer_sparse = True
             is_next_layer_sparse = True
         elif config.model_type == "qwen3_5_text":
-            self.mlp = Qwen2MoeMLP(
+            self.mlp = _Qwen35Rdna4FusedMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
@@ -763,9 +1137,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+        self.input_layernorm = _Qwen35Rdna4FusedGemmaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, keep_bf16=True
+        )
+        self.post_attention_layernorm = _Qwen35Rdna4FusedGemmaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, keep_bf16=False
         )
         # GDN layers need both bf16 (for the small in_proj_ba gating
         # projection) and a quantized tuple only when in_proj_qkvz can consume
@@ -803,7 +1179,10 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
         )
 
-        if not forward_batch.forward_mode.is_idle() and hidden_states.shape[0] > 0:
+        if (
+            not forward_batch.forward_mode.is_idle()
+            and _hidden_states_num_tokens(hidden_states) > 0
+        ):
             hidden_states = self.linear_attn(
                 hidden_states,
                 forward_batch,
@@ -813,6 +1192,20 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        debug_mtp_layer0 = (
+            get_bool_env_var("SGLANG_DEBUG_MTP_INPUTS", "False")
+            and self.layer_id == 0
+            and forward_batch.forward_mode.is_target_verify()
+        )
+        if debug_mtp_layer0:
+            logger.info(
+                "MTP_DEBUG layer0 prepare_mlp hidden_finite=%s hidden_norms=%s "
+                "residual_finite=%s residual_norms=%s",
+                torch.isfinite(hidden_states).flatten(1).all(1).tolist(),
+                hidden_states.float().norm(dim=-1).tolist(),
+                torch.isfinite(residual).flatten(1).all(1).tolist(),
+                residual.float().norm(dim=-1).tolist(),
+            )
 
         mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
@@ -832,13 +1225,44 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                     hidden_states,
                     forward_batch,
                 )
+            elif debug_mtp_layer0:
+                gate_up, _ = self.mlp.gate_up_proj(hidden_states)
+                logger.info(
+                    "MTP_DEBUG layer0 gate_up finite=%s norms=%s",
+                    torch.isfinite(gate_up).flatten(1).all(1).tolist(),
+                    gate_up.float().norm(dim=-1).tolist(),
+                )
+                activated = self.mlp.act_fn(gate_up)
+                logger.info(
+                    "MTP_DEBUG layer0 activation finite=%s norms=%s maxabs=%s",
+                    torch.isfinite(activated).flatten(1).all(1).tolist(),
+                    activated.float().norm(dim=-1).tolist(),
+                    activated.float().abs().amax(dim=-1).tolist(),
+                )
+                hidden_states, _ = self.mlp.down_proj(activated)
             else:
                 hidden_states = self.mlp(hidden_states)
+        if debug_mtp_layer0:
+            logger.info(
+                "MTP_DEBUG layer0 local_mlp finite=%s norms=%s",
+                torch.isfinite(hidden_states).flatten(1).all(1).tolist(),
+                hidden_states.float().norm(dim=-1).tolist(),
+            )
         if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
+            )
+        if debug_mtp_layer0:
+            logger.info(
+                "MTP_DEBUG layer0 postprocess hidden_finite=%s hidden_norms=%s "
+                "residual_finite=%s residual_norms=%s fuse_ar=%s",
+                torch.isfinite(hidden_states).flatten(1).all(1).tolist(),
+                hidden_states.float().norm(dim=-1).tolist(),
+                torch.isfinite(residual).flatten(1).all(1).tolist(),
+                residual.float().norm(dim=-1).tolist(),
+                fuse_mlp_allreduce,
             )
 
         return hidden_states, residual
@@ -930,6 +1354,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             tp_size=self.attn_tp_size,
             prefix=add_prefix("o_proj", prefix),
         )
+        self._rdna4_fused_output_gate_quant_enabled = LazyValue(
+            self._can_use_rdna4_fused_output_gate_quant
+        )
 
         self.attn = RadixAttention(
             self.num_heads,
@@ -943,7 +1370,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         # Dense MLP for non-MoE variant
         if config.model_type == "qwen3_5_text":
-            self.mlp = Qwen2MoeMLP(
+            self.mlp = _Qwen35Rdna4FusedMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
@@ -981,9 +1408,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+        self.input_layernorm = _Qwen35Rdna4FusedGemmaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, keep_bf16=False
+        )
+        self.post_attention_layernorm = _Qwen35Rdna4FusedGemmaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, keep_bf16=False
         )
 
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -1005,6 +1434,18 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         )
 
         self.alt_stream = alt_stream
+
+    def _can_use_rdna4_fused_output_gate_quant(self) -> bool:
+        return bool(
+            self.attn_tp_size in (2, 4)
+            and self.hidden_size == 5120
+            and self.total_num_heads == 24
+            and self.num_heads == self.total_num_heads // self.attn_tp_size
+            and self.head_dim == 256
+            and self.q_size == self.num_heads * self.head_dim
+            and self.attn_output_gate
+            and _is_rdna4_qwen35_output_projection(self.o_proj)
+        )
 
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
@@ -1071,7 +1512,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         return q, k, v, gate
 
     def forward_prepare_native(self, positions, hidden_states):
-        if _use_aiter and isinstance(hidden_states, tuple):
+        if isinstance(hidden_states, tuple):
             hidden_states = _select_fused_ar_input_for_linear(
                 hidden_states, self.qkv_proj
             )
@@ -1094,7 +1535,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         return q, k, v, gate
 
     def forward_prepare_fused_gate(self, positions, hidden_states):
-        if _use_aiter and isinstance(hidden_states, tuple):
+        if isinstance(hidden_states, tuple):
             hidden_states = _select_fused_ar_input_for_linear(
                 hidden_states, self.qkv_proj
             )
@@ -1180,7 +1621,28 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            if not _is_npu:
+            num_tokens = attn_output.shape[0]
+            local_q_size = self.num_heads * self.head_dim
+            if (
+                self._rdna4_fused_output_gate_quant_enabled.value
+                and (
+                    1 <= num_tokens <= 8
+                    or (_rdna4_prefill_output_quant and 8 < num_tokens <= 8192)
+                )
+                and attn_output.shape == (num_tokens, local_q_size)
+                and gate.shape == (num_tokens, local_q_size)
+                and attn_output.dtype == torch.bfloat16
+                and gate.dtype == torch.bfloat16
+                and attn_output.is_contiguous()
+                and gate.is_contiguous()
+            ):
+                attn_output = _rdna4_fused_sigmoid_mul_fp8_group_quant(
+                    attn_output,
+                    gate,
+                    group_size=128,
+                    out_dtype=torch.float8_e4m3fn,
+                )
+            elif not _is_npu:
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
             else:
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
@@ -1207,7 +1669,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
         )
 
-        if not forward_batch.forward_mode.is_idle() and hidden_states.shape[0] > 0:
+        if (
+            not forward_batch.forward_mode.is_idle()
+            and _hidden_states_num_tokens(hidden_states) > 0
+        ):
             hidden_states = self.self_attention(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1447,6 +1912,26 @@ class Qwen3_5ForCausalLM(nn.Module):
                         if getattr(layer, "_is_layer_to_capture", False)
                         else None
                     ),
+                )
+            if (
+                get_bool_env_var("SGLANG_DEBUG_MTP_INPUTS", "False")
+                and forward_batch.forward_mode.is_target_verify()
+                and get_parallel().tp_rank == 0
+            ):
+                actual_hidden = (
+                    hidden_states
+                    if residual is None
+                    else hidden_states + residual
+                )
+                logger.info(
+                    "MTP_DEBUG target_layer=%d actual_norms=%s hidden_norms=%s "
+                    "residual_norms=%s",
+                    layer_idx,
+                    actual_hidden.float().norm(dim=-1).tolist(),
+                    hidden_states.float().norm(dim=-1).tolist(),
+                    None
+                    if residual is None
+                    else residual.float().norm(dim=-1).tolist(),
                 )
 
             # Process deepstack embeddings if provided

@@ -920,18 +920,18 @@ class GroupCoordinator:
                 and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
             )
         if (
+            self.qr_comm is not None
+            and not self.qr_comm.disabled
+            and self.qr_comm.should_quick_allreduce(input_)
+        ):
+            return "qr"
+        if (
             self.ca_comm is not None
             and not self.ca_comm.disabled
             and not should_use_pymscclpp_allreduce
             and self.ca_comm.should_custom_ar(input_)
         ):
             return "ca"
-        if (
-            self.qr_comm is not None
-            and not self.qr_comm.disabled
-            and self.qr_comm.should_quick_allreduce(input_)
-        ):
-            return "qr"
         if self.pymscclpp_comm is not None and should_use_pymscclpp_allreduce:
             return "pymscclpp"
         if (

@@ -1429,10 +1429,20 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 otherwise it will be `(seq_len,).
                 (Use input_metadata.mrope_positions to replace it)
         """
-        if self.is_mrope_enabled:
+        # Text-only Qwen-VL requests have identical temporal/height/width
+        # positions, so ordinary 1-D RoPE is mathematically equivalent.  Keep
+        # the 3-D MRoPE kernel for requests that actually carry multimodal
+        # inputs; this also avoids a correctness issue in speculative verify on
+        # gfx1201's Triton MRoPE path.
+        if self.is_mrope_enabled and forward_batch.contains_mm_inputs():
             positions = forward_batch.mrope_positions
 
-        if self.language_model_only:
+        # Do not route pure-text traffic through the generic multimodal
+        # embedding routine.  Besides avoiding unnecessary Python/tensor work,
+        # the direct path is required by Qwen3.5 hybrid target/speculative
+        # execution on ROCm; the generic path can leave text-only decode state
+        # inconsistent even though it has no media embeddings to merge.
+        if self.language_model_only or not forward_batch.contains_mm_inputs():
             hidden_states = self.model(
                 input_ids=input_ids,
                 forward_batch=forward_batch,

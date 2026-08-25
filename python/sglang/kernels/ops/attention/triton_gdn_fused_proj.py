@@ -426,3 +426,204 @@ def fused_qkv_split_gdn_prefill(
         num_stages=3,
     )
     return q, k, v
+
+
+# Adapted from the local vLLM GDN prefill preparation kernel.  Keeping the
+# implementation here avoids importing vLLM at runtime and lets SGLang use the
+# fused path independently.
+@triton.jit
+def fused_gdn_prefill_prep_kernel(
+    mixed_qkv,
+    a,
+    b,
+    A_log,
+    dt_bias,
+    q,
+    k,
+    v,
+    g,
+    beta,
+    stride_x_t,
+    stride_a_t,
+    stride_b_t,
+    stride_q_t,
+    stride_k_t,
+    stride_v_t,
+    SEQ_LEN,
+    NUM_K_HEADS: tl.constexpr,
+    NUM_V_HEADS: tl.constexpr,
+    HEAD_K: tl.constexpr,
+    HEAD_V: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    L2NORM_EPS: tl.constexpr,
+    SOFTPLUS_THRESHOLD: tl.constexpr,
+):
+    """Split Q/K/V, normalize Q/K, and form GDN gates in one launch."""
+    token_block = tl.program_id(0)
+    head = tl.program_id(1)
+    token_offsets = token_block * BLOCK_T + tl.arange(0, BLOCK_T)
+    token_mask = token_offsets < SEQ_LEN
+    qk_dim: tl.constexpr = NUM_K_HEADS * HEAD_K
+
+    if head < NUM_K_HEADS:
+        feature_offsets = tl.arange(0, BLOCK_K)
+        feature_mask = feature_offsets < HEAD_K
+        mask = token_mask[:, None] & feature_mask[None, :]
+
+        q_offsets = (
+            token_offsets[:, None] * stride_x_t
+            + head * HEAD_K
+            + feature_offsets[None, :]
+        )
+        k_offsets = q_offsets + qk_dim
+        q_values = tl.load(mixed_qkv + q_offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        k_values = tl.load(mixed_qkv + k_offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
+
+        # Use the same division/sqrt form as FLA's l2norm_fwd kernel.  On
+        # gfx1201 tl.rsqrt has a measurably different approximation and shifts
+        # the recurrent state enough to change greedy output on long runs.
+        q_values /= tl.sqrt(
+            tl.sum(q_values * q_values, axis=1)[:, None] + L2NORM_EPS
+        )
+        k_values /= tl.sqrt(
+            tl.sum(k_values * k_values, axis=1)[:, None] + L2NORM_EPS
+        )
+
+        q_out_offsets = (
+            token_offsets[:, None] * stride_q_t
+            + head * HEAD_K
+            + feature_offsets[None, :]
+        )
+        k_out_offsets = (
+            token_offsets[:, None] * stride_k_t
+            + head * HEAD_K
+            + feature_offsets[None, :]
+        )
+        tl.store(q + q_out_offsets, q_values, mask=mask)
+        tl.store(k + k_out_offsets, k_values, mask=mask)
+    else:
+        value_head = head - NUM_K_HEADS
+        value_offsets = tl.arange(0, BLOCK_V)
+        value_mask = value_offsets < HEAD_V
+        mask = token_mask[:, None] & value_mask[None, :]
+        packed_v_offsets = (
+            token_offsets[:, None] * stride_x_t
+            + 2 * qk_dim
+            + value_head * HEAD_V
+            + value_offsets[None, :]
+        )
+        v_values = tl.load(mixed_qkv + packed_v_offsets, mask=mask, other=0.0)
+        v_out_offsets = (
+            token_offsets[:, None] * stride_v_t
+            + value_head * HEAD_V
+            + value_offsets[None, :]
+        )
+        tl.store(v + v_out_offsets, v_values, mask=mask)
+
+        gate_offsets = token_offsets * NUM_V_HEADS + value_head
+        a_values = tl.load(
+            a + token_offsets * stride_a_t + value_head,
+            mask=token_mask,
+            other=0.0,
+        ).to(tl.float32)
+        b_values = tl.load(
+            b + token_offsets * stride_b_t + value_head,
+            mask=token_mask,
+            other=0.0,
+        ).to(tl.float32)
+        a_log = tl.load(A_log + value_head).to(tl.float32)
+        bias = tl.load(dt_bias + value_head).to(tl.float32)
+        x = a_values + bias
+        # Match SGLang's existing fused_gdn_gating arithmetic.
+        softplus = tl.where(
+            x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x
+        )
+        tl.store(
+            g + gate_offsets,
+            -tl.exp(a_log) * softplus,
+            mask=token_mask,
+        )
+        tl.store(
+            beta + gate_offsets,
+            tl.sigmoid(b_values).to(b.dtype.element_ty),
+            mask=token_mask,
+        )
+
+
+def fused_gdn_prefill_prep(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_k: int,
+    head_v: int,
+):
+    """Return normalized Q/K plus V/G/Beta in the GDN prefill layouts."""
+    seq_len = mixed_qkv.shape[0]
+    expected_dim = 2 * num_k_heads * head_k + num_v_heads * head_v
+    if mixed_qkv.shape[1] != expected_dim:
+        raise ValueError(
+            f"packed GDN width {mixed_qkv.shape[1]} does not match {expected_dim}"
+        )
+
+    q = torch.empty(
+        (1, seq_len, num_k_heads, head_k),
+        dtype=mixed_qkv.dtype,
+        device=mixed_qkv.device,
+    )
+    k = torch.empty_like(q)
+    v = torch.empty(
+        (1, seq_len, num_v_heads, head_v),
+        dtype=mixed_qkv.dtype,
+        device=mixed_qkv.device,
+    )
+    g = torch.empty(
+        (1, seq_len, num_v_heads), dtype=torch.float32, device=mixed_qkv.device
+    )
+    beta = torch.empty_like(g)
+    if seq_len == 0:
+        return q, k, v, g, beta
+
+    block_t = 16
+    fused_gdn_prefill_prep_kernel[
+        (triton.cdiv(seq_len, block_t), num_k_heads + num_v_heads)
+    ](
+        mixed_qkv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        mixed_qkv.stride(0),
+        a.stride(0),
+        b.stride(0),
+        q.stride(1),
+        k.stride(1),
+        v.stride(1),
+        seq_len,
+        num_k_heads,
+        num_v_heads,
+        head_k,
+        head_v,
+        BLOCK_T=block_t,
+        BLOCK_K=triton.next_power_of_2(head_k),
+        BLOCK_V=triton.next_power_of_2(head_v),
+        L2NORM_EPS=1e-6,
+        SOFTPLUS_THRESHOLD=20.0,
+        num_warps=4,
+        num_stages=2,
+    )
+    return q, k, v, g, beta

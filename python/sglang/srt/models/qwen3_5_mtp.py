@@ -23,12 +23,23 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group
+from sglang.kernels.ops.gemm.rdna4_fp8_skinny import (
+    rdna4_fp8_blockwise_skinny,
+    rdna4_fp8_lm_head_refine,
+)
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    per_token_group_quant_fp8,
+)
+from sglang.srt.distributed import get_pp_group, get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layernorm import GemmaRMSNorm
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import (
+    LogitsMetadata,
+    LogitsProcessor,
+    LogitsProcessorOutput,
+)
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -39,7 +50,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import add_prefix, get_bool_env_var, is_gfx1201_supported, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +148,9 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 )
 
         self.logits_processor = LogitsProcessor(config)
+        self._local_argmax_enabled = False
+        self._local_argmax_head_identity = None
+        self._local_argmax_partitions = 512
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -167,6 +181,156 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         self.lm_head = target_lm_head
 
     @torch.no_grad()
+    def prepare_local_argmax(self) -> None:
+        """Build the gfx1201 FP8 shortlist head used by greedy MTP decode.
+
+        The original BF16 shard remains authoritative: the FP8 copy proposes
+        one row per vocab partition and the refinement kernel rescans only
+        those candidates with the original weights.
+        """
+        if not get_bool_env_var("SGLANG_ROCM_MTP_FP8_LM_HEAD", "0"):
+            return
+        weight = getattr(self.lm_head, "weight", None)
+        if (
+            not is_gfx1201_supported()
+            or not isinstance(weight, torch.Tensor)
+            or not weight.is_cuda
+            or weight.dtype != torch.bfloat16
+            or weight.ndim != 2
+            or not weight.is_contiguous()
+            or weight.shape[0] % 128 != 0
+            or weight.shape[1] % 128 != 0
+            or getattr(self.lm_head, "num_added_embeddings", 0) != 0
+        ):
+            logger.warning_once(
+                "ROCm MTP local FP8 lm_head requested, but the bound head does "
+                "not satisfy the gfx1201 BF16 128x128 contract; using the "
+                "regular full-vocabulary path."
+            )
+            return
+        if self._local_argmax_head_identity == id(weight):
+            return
+
+        # Quantize in modest row-block chunks.  A single vectorized conversion
+        # would transiently materialize several GB of FP32 abs values for the
+        # TP2 head and can make an otherwise fitting model fail at startup.
+        rows, hidden = weight.shape
+        weight_fp8 = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
+        weight_scale = torch.empty(
+            (rows // 128, hidden // 128), dtype=torch.float32, device=weight.device
+        )
+        row_blocks_per_chunk = 32
+        for block_start in range(0, rows // 128, row_blocks_per_chunk):
+            block_end = min(block_start + row_blocks_per_chunk, rows // 128)
+            row_start, row_end = block_start * 128, block_end * 128
+            view = weight[row_start:row_end].view(
+                block_end - block_start, 128, hidden // 128, 128
+            )
+            scale = view.abs().float().amax(dim=(1, 3)).clamp_(min=1e-4) / 448.0
+            quantized = (view / scale[:, None, :, None]).to(torch.float8_e4m3fn)
+            weight_fp8[row_start:row_end].copy_(
+                quantized.reshape(row_end - row_start, hidden)
+            )
+            weight_scale[block_start:block_end].copy_(scale)
+
+        self.register_buffer(
+            "_local_argmax_weight_fp8", weight_fp8, persistent=False
+        )
+        self.register_buffer(
+            "_local_argmax_weight_scale", weight_scale, persistent=False
+        )
+        self._local_argmax_head_identity = id(weight)
+        self._local_argmax_enabled = True
+        torch.cuda.empty_cache()
+        logger.info(
+            "Prepared gfx1201 block-FP8 MTP lm_head shortlist (shape=%s, "
+            "partitions=%d).",
+            tuple(weight.shape),
+            self._local_argmax_partitions,
+        )
+
+    def is_local_argmax_output(self, output: torch.Tensor) -> bool:
+        return self._local_argmax_enabled and output.ndim == 2 and output.shape[-1] == 2
+
+    def select_top_tokens_from_local_output(
+        self, local_pair: torch.Tensor
+    ) -> torch.Tensor:
+        """Reduce shard-local ``(exact score, global token id)`` pairs."""
+        gathered = get_tp_group().all_gather(local_pair, dim=-1)
+        gathered = gathered.view(local_pair.shape[0], self.tp_size, 2)
+        rank = gathered[..., 0].argmax(dim=-1, keepdim=True)
+        return gathered[..., 1].gather(-1, rank).to(torch.int64)
+
+    def _local_argmax_logits_output(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Optional[LogitsProcessorOutput]:
+        if not self._local_argmax_enabled:
+            return None
+        metadata = LogitsMetadata.from_forward_batch(forward_batch)
+        if metadata.extend_return_logprob:
+            return None
+        (
+            pruned_states,
+            pruned_states_before_norm,
+            aux_pruned_states,
+            sample_indices,
+            *_unused,
+        ) = self.logits_processor._get_pruned_states(
+            hidden_states, None, None, metadata
+        )
+        # The local skinny head is deliberately specialized to concurrency 1.
+        # Larger graph buckets and real batches retain the general BF16 path.
+        if pruned_states.shape[0] != 1:
+            return None
+        hidden_states_to_store = self.logits_processor._get_hidden_states_to_store(
+            hidden_states,
+            None,
+            None,
+            pruned_states,
+            pruned_states_before_norm,
+            aux_pruned_states,
+            sample_indices,
+            metadata,
+        )
+        head_input = (
+            pruned_states[sample_indices]
+            if sample_indices is not None
+            else pruned_states
+        ).contiguous()
+        activation_fp8, activation_scale = per_token_group_quant_fp8(
+            head_input, 128
+        )
+        approximate_logits = rdna4_fp8_blockwise_skinny(
+            activation_fp8,
+            self._local_argmax_weight_fp8,
+            activation_scale.contiguous(),
+            self._local_argmax_weight_scale,
+        )
+        num_pad = self.lm_head.shard_indices.num_org_vocab_padding
+        if num_pad > 0:
+            approximate_logits[..., -num_pad:] = -float("inf")
+        local_values, local_indices = rdna4_fp8_lm_head_refine(
+            approximate_logits,
+            head_input,
+            self.lm_head.weight,
+            self._local_argmax_partitions,
+        )
+        global_indices = (
+            local_indices + self.lm_head.shard_indices.org_vocab_start_index
+        )
+        local_pair = torch.stack(
+            (local_values.float(), global_indices.float()), dim=-1
+        )
+        return LogitsProcessorOutput(
+            next_token_logits=local_pair,
+            hidden_states=hidden_states_to_store,
+            mm_input_embeds=metadata.mm_input_embeds,
+        )
+
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -176,6 +340,14 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         **kwargs,
     ):
         exit_stack = ExitStack()
+        # Match the target Qwen-VL wrapper: real multimodal requests consume
+        # their three-axis MRoPE positions, while pure-text requests use the
+        # equivalent (and faster) 1-D position path.
+        if (
+            forward_batch.mrope_positions is not None
+            and forward_batch.contains_mm_inputs()
+        ):
+            positions = forward_batch.mrope_positions
         if (
             is_npu()
             and self.quant_config is None
@@ -225,9 +397,12 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         finally:
             exit_stack.close()
 
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+        local_output = self._local_argmax_logits_output(
+            input_ids, hidden_states, forward_batch
         )
+        if local_output is not None:
+            return local_output
+        return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
 
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False

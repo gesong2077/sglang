@@ -1,5 +1,6 @@
 import contextlib
 import logging
+import os
 import time
 from dataclasses import replace
 from typing import List, Optional
@@ -317,6 +318,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
+
+        prepare_local_argmax = getattr(
+            self.draft_runner.model, "prepare_local_argmax", None
+        )
+        if prepare_local_argmax is not None:
+            prepare_local_argmax()
+
+    def _is_local_argmax_output(self, logits: torch.Tensor) -> bool:
+        predicate = getattr(
+            self.draft_runner.model, "is_local_argmax_output", None
+        )
+        return predicate is not None and predicate(logits)
+
+    def _select_local_argmax_output(self, logits: torch.Tensor) -> torch.Tensor:
+        return self.draft_runner.model.select_top_tokens_from_local_output(logits)
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -668,6 +684,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     draft_probs_list.append(probs)
                     forward_batch.positions.add_(1)
+                elif self.topk == 1 and self._is_local_argmax_output(
+                    logits_output.next_token_logits
+                ):
+                    topk_index = self._select_local_argmax_output(
+                        logits_output.next_token_logits
+                    )
+                    topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+                    forward_batch.positions.add_(1)
                 elif self.topk == 1 and not _is_hip:
                     if _is_cuda:
                         topk_p, topk_index = draft_topk1_postprocess(
@@ -693,8 +717,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 maybe_detect_oob(
                     topk_index,
                     0,
-                    logits_output.next_token_logits.shape[-1],
-                    f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+                    self.draft_runner.model_config.vocab_size,
+                    "draft_forward step "
+                    f"{i}: topk_index OOB vs vocab_size="
+                    f"{self.draft_runner.model_config.vocab_size}",
                 )
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]
@@ -786,6 +812,27 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
 
+        debug_mtp_inputs = os.getenv("SGLANG_DEBUG_MTP_INPUTS", "0") == "1"
+        if debug_mtp_inputs and get_parallel().tp_rank == 0:
+            hidden_norms = target_hidden_states.float().norm(dim=-1)
+            logger.info(
+                "MTP_DEBUG prefill input_ids_tail=%s positions_tail=%s "
+                "hidden_shape=%s hidden_norm_first_last=(%.6f, %.6f) "
+                "next_token_ids=%s contains_mm=%s mm_input_embeds=%s "
+                "model_is_mrope=%s",
+                batch.input_ids[-16:].tolist(),
+                forward_batch.positions[..., -16:].tolist(),
+                tuple(target_hidden_states.shape),
+                hidden_norms[0].item(),
+                hidden_norms[-1].item(),
+                next_token_ids.tolist(),
+                forward_batch.contains_mm_inputs(),
+                None
+                if forward_batch.mm_input_embeds is None
+                else tuple(forward_batch.mm_input_embeds.shape),
+                self.draft_runner.model_config.model_is_mrope,
+            )
+
         # Seed the first draft-decode loop from each request's last prefill
         # position. Gather last-per-req before the copy (prefill can be long).
         seed_from_extend = (
@@ -823,15 +870,37 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Assemble the next-iter draft spec_info from the extend output.
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-        probs = renorm_draft_probs(
-            logits_output.next_token_logits,
-            batch.sampling_info,
-            use_rejection_sampling,
-        )
+        if self.topk == 1 and self._is_local_argmax_output(
+            logits_output.next_token_logits
+        ):
+            topk_index = self._select_local_argmax_output(
+                logits_output.next_token_logits
+            )
+            topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+            probs = None
+        else:
+            probs = renorm_draft_probs(
+                logits_output.next_token_logits,
+                batch.sampling_info,
+                use_rejection_sampling,
+            )
         if use_rejection_sampling:
             topk_p, topk_index = fast_sample(probs, num_samples=1)
-        else:
+        elif probs is not None:
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+        if debug_mtp_inputs and get_parallel().tp_rank == 0:
+            raw_logits = logits_output.next_token_logits
+            raw_values, raw_indices = torch.topk(raw_logits, min(5, raw_logits.shape[-1]))
+            logger.info(
+                "MTP_DEBUG prefill candidate=%s top5_ids=%s top5_logits=%s "
+                "draft_hidden_shape=%s",
+                topk_index.tolist(),
+                raw_indices.tolist(),
+                raw_values.float().tolist(),
+                None
+                if logits_output.hidden_states is None
+                else tuple(logits_output.hidden_states.shape),
+            )
         return EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
@@ -973,6 +1042,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output.next_token_logits,
                 batch.sampling_info.temperatures,
             )
+        elif self.topk == 1 and self._is_local_argmax_output(
+            draft_logits_output.next_token_logits
+        ):
+            ret_topk_index = self._select_local_argmax_output(
+                draft_logits_output.next_token_logits
+            )
+            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+            ret_draft_probs = None
         elif self.topk == 1 and not _is_hip:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
             # MTP draft selection on FP8 logits.

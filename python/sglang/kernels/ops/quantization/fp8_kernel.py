@@ -33,6 +33,7 @@ from sglang.srt.utils import (
     get_device_name,
     is_cpu,
     is_cuda,
+    is_gfx1201_supported,
     is_hip,
     is_musa,
     log_info_on_rank0,
@@ -44,7 +45,11 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_musa = is_musa()
+_is_gfx1201 = is_gfx1201_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_rdna4_block_fp8_fastpath = not get_bool_env_var(
+    "SGLANG_DISABLE_RDNA4_BLOCK_FP8_FASTPATH", "False"
+)
 
 if _is_cuda:
     from sglang.kernels.ops.quantization import (
@@ -963,6 +968,11 @@ def _w8a8_block_fp8_matmul(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     needs_masking: tl.constexpr,
+    EVEN_M: tl.constexpr,
+    EVEN_N: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    CONTIGUOUS_FAST_PATH: tl.constexpr,
+    SCALAR_B_SCALE: tl.constexpr,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and store the result in output
@@ -979,35 +989,85 @@ def _w8a8_block_fp8_matmul(
     pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    if CONTIGUOUS_FAST_PATH:
+        offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    else:
+        offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
     As_ptrs = As + offs_am * stride_As_m
-    offs_bsn = offs_bn // group_n
+    if SCALAR_B_SCALE:
+        offs_bsn = (pid_n * BLOCK_SIZE_N) // group_n
+    else:
+        offs_bsn = offs_bn // group_n
     Bs_ptrs = Bs + offs_bsn * stride_Bs_n
-    n_tiles_k_per_group_k = group_k // BLOCK_SIZE_K
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        if needs_masking:
-            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        if CONTIGUOUS_FAST_PATH:
+            if EVEN_M and EVEN_K:
+                a = tl.load(a_ptrs)
+            else:
+                a = tl.load(
+                    a_ptrs,
+                    mask=(offs_am[:, None] < M)
+                    & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+                    other=0.0,
+                )
+            if EVEN_N and EVEN_K:
+                b = tl.load(b_ptrs)
+            else:
+                b = tl.load(
+                    b_ptrs,
+                    mask=(offs_bn[None, :] < N)
+                    & (offs_k[:, None] < K - k * BLOCK_SIZE_K),
+                    other=0.0,
+                )
+        elif needs_masking:
+            a = tl.load(
+                a_ptrs,
+                mask=offs_k[None, :] < K - k * BLOCK_SIZE_K,
+                other=0.0,
+            )
+            b = tl.load(
+                b_ptrs,
+                mask=offs_k[:, None] < K - k * BLOCK_SIZE_K,
+                other=0.0,
+            )
         else:
             a = tl.load(a_ptrs)
             b = tl.load(b_ptrs)
 
-        a_s = tl.load(As_ptrs)
-        b_s = tl.load(Bs_ptrs)
+        k_start = k * BLOCK_SIZE_K
+        offs_ks = k_start // group_k
+        if CONTIGUOUS_FAST_PATH and not EVEN_M:
+            a_s = tl.load(
+                As_ptrs + offs_ks * stride_As_k,
+                mask=offs_am < M,
+                other=0.0,
+            )
+        else:
+            a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
+        if CONTIGUOUS_FAST_PATH and not (SCALAR_B_SCALE or EVEN_N):
+            b_s = tl.load(
+                Bs_ptrs + offs_ks * stride_Bs_k,
+                mask=offs_bn < N,
+                other=0.0,
+            )
+        else:
+            b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
 
-        scale_step_k = tl.where((k + 1) % n_tiles_k_per_group_k == 0, 1, 0)
-        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        dot = tl.dot(a, b)
+        if SCALAR_B_SCALE:
+            accumulator += dot * (a_s * b_s)[:, None]
+        else:
+            accumulator += dot * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
-        As_ptrs += scale_step_k * stride_As_k
-        Bs_ptrs += scale_step_k * stride_Bs_k
 
     if C.dtype.element_ty == tl.bfloat16:
         c = accumulator.to(tl.bfloat16)
@@ -1431,6 +1491,7 @@ def w8a8_block_fp8_matmul_triton(
     Bs: torch.Tensor,
     block_size: List[int],
     output_dtype: torch.dtype = torch.float16,
+    config_override: Optional[Dict[str, Any]] = None,
 ) -> torch.Tensor:
     """This function performs matrix multiplication with block-wise quantization.
 
@@ -1453,8 +1514,14 @@ def w8a8_block_fp8_matmul_triton(
 
     block_n, block_k = block_size
 
-    configs = get_w8a8_block_fp8_configs(N, K, block_size[0], block_size[1])
-    if configs:
+    configs = (
+        None
+        if config_override is not None
+        else get_w8a8_block_fp8_configs(N, K, block_size[0], block_size[1])
+    )
+    if config_override is not None:
+        config = dict(config_override)
+    elif configs:
         # If an optimal configuration map has been found, look up the
         # optimal config
         config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
@@ -1471,6 +1538,19 @@ def w8a8_block_fp8_matmul_triton(
         }
 
     needs_masking = bool(K % config["BLOCK_SIZE_K"] != 0)
+    contiguous_fast_path = bool(
+        _is_gfx1201
+        and _rdna4_block_fp8_fastpath
+        and M % config["BLOCK_SIZE_M"] == 0
+        and N % config["BLOCK_SIZE_N"] == 0
+        and K % config["BLOCK_SIZE_K"] == 0
+    )
+    scalar_b_scale = bool(
+        contiguous_fast_path
+        and config["BLOCK_SIZE_M"] <= 64
+        and config["BLOCK_SIZE_N"] <= block_n
+        and block_n % config["BLOCK_SIZE_N"] == 0
+    )
 
     def grid(META):
         return (
@@ -1502,6 +1582,11 @@ def w8a8_block_fp8_matmul_triton(
         Bs.stride(0),
         **config,
         needs_masking=needs_masking,
+        EVEN_M=M % config["BLOCK_SIZE_M"] == 0,
+        EVEN_N=N % config["BLOCK_SIZE_N"] == 0,
+        EVEN_K=K % config["BLOCK_SIZE_K"] == 0,
+        CONTIGUOUS_FAST_PATH=contiguous_fast_path,
+        SCALAR_B_SCALE=scalar_b_scale,
     )
 
     return C

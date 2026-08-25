@@ -21,6 +21,7 @@ It supports page size = 1.
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage2.py
 
 import logging
+import os
 from typing import NamedTuple, Optional, Tuple
 
 import triton
@@ -28,7 +29,12 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
-from sglang.srt.utils import get_device_core_count, is_gfx95_supported, is_hip
+from sglang.srt.utils import (
+    get_device_core_count,
+    is_gfx95_supported,
+    is_gfx1201_supported,
+    is_hip,
+)
 
 _is_hip = is_hip()
 
@@ -39,6 +45,24 @@ _MIN_BLOCK_KV = 32
 
 # heads per stage-1 tile, shared so the budget's head_tiles cannot drift from the launch
 _GROUPED_BLOCK_H = 16
+
+_GFX1201_GQA_BLOCK_N = int(
+    os.getenv("SGLANG_GFX1201_GQA_DECODE_BLOCK_N", "16")
+)
+if _GFX1201_GQA_BLOCK_N not in (16, 32, 64):
+    raise ValueError("SGLANG_GFX1201_GQA_DECODE_BLOCK_N must be 16, 32, or 64")
+
+_GFX1201_GQA_NUM_WARPS = int(
+    os.getenv("SGLANG_GFX1201_GQA_DECODE_NUM_WARPS", "4")
+)
+if _GFX1201_GQA_NUM_WARPS not in (2, 4, 8):
+    raise ValueError("SGLANG_GFX1201_GQA_DECODE_NUM_WARPS must be 2, 4, or 8")
+
+_GFX1201_GQA_WAVES_PER_EU = int(
+    os.getenv("SGLANG_GFX1201_GQA_DECODE_WAVES_PER_EU", "4")
+)
+if _GFX1201_GQA_WAVES_PER_EU not in (1, 2, 4):
+    raise ValueError("SGLANG_GFX1201_GQA_DECODE_WAVES_PER_EU must be 1, 2, or 4")
 
 
 # gfx950 wants 32 where the HIP path otherwise takes 16. That is the model it was picked
@@ -798,6 +822,12 @@ def _decode_grouped_att_m_fwd(
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
 
+    tune_gfx1201_gqa = (
+        not has_mla and Lk == 256 and is_gfx1201_supported()
+    )
+    if tune_gfx1201_gqa:
+        BLOCK = _GFX1201_GQA_BLOCK_N
+
     # [TODO] work around shmem limit on MI3xx
     if _is_hip and Lk >= 576:
         BLOCK = 16
@@ -831,6 +861,10 @@ def _decode_grouped_att_m_fwd(
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
         num_stages = 1
+
+    if tune_gfx1201_gqa:
+        num_warps = _GFX1201_GQA_NUM_WARPS
+        extra_kargs["waves_per_eu"] = _GFX1201_GQA_WAVES_PER_EU
 
     if tune_mla:
         # num_warps reorders the fp32 accumulation, so whoever declined the batch-wide

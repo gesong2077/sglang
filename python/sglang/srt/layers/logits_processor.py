@@ -15,6 +15,7 @@
 
 import dataclasses
 import logging
+import os
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -345,6 +346,18 @@ class LogitsProcessor(nn.Module):
         if isinstance(logits_metadata, ForwardBatch):
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
+
+        if (
+            os.getenv("SGLANG_DEBUG_MTP_INPUTS", "0") == "1"
+            and logits_metadata.forward_mode.is_target_verify()
+            and get_parallel().tp_rank == 0
+        ):
+            logger.info(
+                "MTP_DEBUG target_hidden shape=%s norms=%s finite=%s",
+                tuple(hidden_states.shape),
+                hidden_states.float().norm(dim=-1).tolist(),
+                torch.isfinite(hidden_states).all(dim=-1).tolist(),
+            )
 
         # Autotune dummy run discards this output. `is False` not `not`: None
         # means no autotune pass, which must not skip. Placed before the MIS /

@@ -1,7 +1,12 @@
 #pragma once
 
+#include <algorithm>
+#include <cerrno>
+#include <cstdlib>
 #include <hip/hip_runtime.h>
-
+#include <limits>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "quick_all_reduce.cuh"
@@ -28,24 +33,30 @@ __global__ __quickreduce_launch_bounds_two_shot__ static void allreduce_prototyp
     int rank,
     uint8_t** dbuffer_list,
     uint32_t data_offset,
-    uint32_t* d_flag_counters,
+    uint32_t flag_color,
     int64_t data_size_per_phase) {
   int block = blockIdx.x;
   int grid = gridDim.x;
-
-  // Read this block's counter from device memory and bump it here in the
-  // kernel. Keeping the value in device memory (instead of a host scalar
-  // baked into the launch) lets every CUDA-graph replay see a fresh color.
-  uint32_t flag_color = d_flag_counters[blockIdx.x];
+  const bool graph_mode = flag_color == 0;
+  __shared__ uint32_t graph_flag_base;
+  if (graph_mode) {
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+      constexpr uint32_t kGraphEpochsOffset =
+          4 * AllReduceKernel::kWorldSize * kMaxNumBlocks * sizeof(uint32_t);
+      auto* graph_epochs =
+          reinterpret_cast<uint32_t*>(dbuffer_list[rank] + kGraphEpochsOffset);
+      const uint32_t logical_tiles = divceil(num_blocks - block, grid);
+      graph_flag_base = atomicAdd(&graph_epochs[blockIdx.x], logical_tiles) + 1U;
+    }
+    __syncthreads();
+    flag_color = graph_flag_base;
+  }
 
   while (block < num_blocks) {
-    AllReduceKernel::run(A, B, N, block, rank, dbuffer_list, data_offset, flag_color, data_size_per_phase);
+    AllReduceKernel::run(
+        A, B, N, block, rank, dbuffer_list, data_offset, flag_color, graph_mode, data_size_per_phase);
     block += grid;
     flag_color++;
-  }
-  // The whole block ends up with the same value, so a single writer suffices.
-  if (threadIdx.x == 0 && threadIdx.y == 0) {
-    d_flag_counters[blockIdx.x] = flag_color;
   }
 }
 
@@ -66,7 +77,7 @@ __global__ __quickreduce_launch_bounds_two_shot__ static void allreduce_prototyp
         rank,                                                             \
         dbuffer_list,                                                     \
         data_offset,                                                      \
-        d_flag_counters,                                                  \
+        launch_flag_color,                                                \
         this->kMaxProblemSize);                                           \
   } else if (world_size == 4) {                                           \
     using LineCodec = __codec<T, 4>;                                      \
@@ -84,7 +95,7 @@ __global__ __quickreduce_launch_bounds_two_shot__ static void allreduce_prototyp
         rank,                                                             \
         dbuffer_list,                                                     \
         data_offset,                                                      \
-        d_flag_counters,                                                  \
+        launch_flag_color,                                                \
         this->kMaxProblemSize);                                           \
   } else if (world_size == 8) {                                           \
     using LineCodec = __codec<T, 8>;                                      \
@@ -102,7 +113,7 @@ __global__ __quickreduce_launch_bounds_two_shot__ static void allreduce_prototyp
         rank,                                                             \
         dbuffer_list,                                                     \
         data_offset,                                                      \
-        d_flag_counters,                                                  \
+        launch_flag_color,                                                \
         this->kMaxProblemSize);                                           \
   }
 
@@ -121,7 +132,8 @@ struct DeviceComms {
   static int constexpr kMaxWorldSize = 8;
 
   bool initialized = false;
-  uint32_t* d_flag_counters = nullptr;
+  uint32_t flag_color = 1;
+  uint32_t max_grid_blocks = kMaxNumBlocks;
   int world_size;
   int rank;
 
@@ -142,25 +154,42 @@ struct DeviceComms {
     this->world_size = world_size;
     this->rank = rank;
     if (max_problem_size.has_value() && max_problem_size.value() > 0) {
+      if (max_problem_size.value() >
+          static_cast<int64_t>(std::numeric_limits<int32_t>::max()) + 1) {
+        throw std::runtime_error("QuickReduce max_problem_size must not exceed 2 GiB");
+      }
       this->kMaxProblemSize = max_problem_size.value();
     }
+    max_grid_blocks = kMaxNumBlocks;
+    int device = 0;
+    hipDeviceProp_t device_prop{};
+    HIP_CHECK(hipGetDevice(&device));
+    HIP_CHECK(hipGetDeviceProperties(&device_prop, device));
+    if (std::string(device_prop.gcnArchName).find("gfx1201") != std::string::npos) {
+      // Keep peer-spinning CTAs within the R9700's 64-CU scheduling capacity.
+      max_grid_blocks = 64;
+    }
+    if (const char* value = std::getenv("SGLANG_ROCM_GFX1201_QUICK_REDUCE_MAX_BLOCKS")) {
+      char* end = nullptr;
+      errno = 0;
+      const unsigned long requested = std::strtoul(value, &end, 10);
+      if (value[0] == '-' || errno == ERANGE || end == value || *end != '\0' || requested == 0) {
+        throw std::runtime_error(
+            "SGLANG_ROCM_GFX1201_QUICK_REDUCE_MAX_BLOCKS must be a positive integer");
+      }
+      max_grid_blocks = static_cast<uint32_t>(std::min<unsigned long>(requested, kMaxNumBlocks));
+    }
     // Allocate buffer size for worst case: F16 2-stage buffer.
-    uint32_t flags_buffer_size = 2 * world_size * kMaxNumBlocks * sizeof(uint32_t);
-    static int64_t data_buffer_size = 2 * this->kMaxProblemSize;
+    // Eager and captured graphs use disjoint flag-bank pairs. The final bank
+    // stores graph-replay epochs that are allocated on device.
+    uint32_t flags_buffer_size = (4 * world_size + 1) * kMaxNumBlocks * sizeof(uint32_t);
+    const int64_t data_buffer_size = 2 * this->kMaxProblemSize;
     int64_t total_buffer_size = flags_buffer_size + data_buffer_size;
     data_offset = flags_buffer_size;
     HIP_CHECK(hipExtMallocWithFlags((void**)&dbuffer, total_buffer_size, hipDeviceMallocUncached));
 
     // Clear the flags buffer.
     HIP_CHECK(hipMemset(dbuffer, 0, flags_buffer_size));
-
-    // A per-block color counter that the kernel advances itself. Seed it with
-    // 1 rather than 0 so it never matches the freshly zeroed flags buffer.
-    HIP_CHECK(hipMalloc(&d_flag_counters, kMaxNumBlocks * sizeof(uint32_t)));
-    {
-      std::vector<uint32_t> init_color(kMaxNumBlocks, 1u);
-      HIP_CHECK(hipMemcpy(d_flag_counters, init_color.data(), kMaxNumBlocks * sizeof(uint32_t), hipMemcpyHostToDevice));
-    }
 
     // Device-side list of IPC buffers.
     buffer_list.resize(world_size);
@@ -186,12 +215,6 @@ struct DeviceComms {
   }
 
   void destroy() {
-    // This buffer is created before `initialized` becomes true, so release it
-    // on its own check to keep a half-finished init from leaking it.
-    if (d_flag_counters) {
-      HIP_CHECK(hipFree(d_flag_counters));
-      d_flag_counters = nullptr;
-    }
     if (initialized) {
       for (int i = 0; i < world_size; i++) {
         if (i != rank) {
@@ -231,11 +254,27 @@ struct DeviceComms {
     if (world_size != 2 && world_size != 4 && world_size != 8) {
       throw std::runtime_error("All Reduce not supported for world_size = " + std::to_string(world_size));
     }
+    if (N == 0) {
+      return;
+    }
 
     // Configuration.
     uint32_t msg_size = N * sizeof(T);
     uint32_t num_blocks = divceil(msg_size, kTileSize);
-    uint32_t grid = min(kMaxNumBlocks, num_blocks);
+    const uint32_t logical_tiles_per_block = divceil(num_blocks, max_grid_blocks);
+    uint32_t grid = divceil(num_blocks, logical_tiles_per_block);
+    const uint32_t logical_tiles_per_launch = divceil(num_blocks, grid);
+    if (flag_color == 0 ||
+        flag_color > std::numeric_limits<uint32_t>::max() - logical_tiles_per_launch) {
+      flag_color = 1;
+    }
+    uint32_t launch_flag_color = flag_color;
+    hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+    HIP_CHECK(hipStreamIsCapturing(stream, &capture_status));
+    if (capture_status != hipStreamCaptureStatusNone) {
+      // Zero tells the kernel to reserve a fresh epoch on every graph replay.
+      launch_flag_color = 0;
+    }
     auto quant_level_ = static_cast<QuickReduceQuantLevel>(quant_level);
     switch (quant_level_) {
       case QuickReduceQuantLevel::INT8:
@@ -252,7 +291,10 @@ struct DeviceComms {
         break;
     }
     HIP_CHECK(cudaGetLastError());
-    // The color now advances on-device inside the kernel; no host-side bump.
+    flag_color += logical_tiles_per_launch;
+    if (flag_color == 0) {
+      flag_color = 1;
+    }
   }
 };
 

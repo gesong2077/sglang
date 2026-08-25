@@ -139,6 +139,8 @@ elif _is_hip:
     def init_custom_qr(
         rank: int, world_size: int, qr_max_size: Optional[int] = None
     ) -> int:
+        # sgl_kernel.allreduce keeps the historical extension argument order;
+        # swap here so the C++ operator receives (rank, world_size).
         return _custom_ar.init_custom_qr(world_size, rank, qr_max_size)
 
     def qr_get_handle(fa: int) -> torch.Tensor:

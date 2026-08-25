@@ -328,9 +328,12 @@ class ModelConfig:
         rope_scaling = getattr(self.hf_text_config, "rope_parameters", None) or getattr(
             self.hf_text_config, "rope_scaling", {}
         )
-        self.is_lm_only = getattr(self.hf_config, "language_model_only", False)
+        self.is_lm_only = language_model_only or getattr(
+            self.hf_config, "language_model_only", False
+        )
         self.model_is_mrope = (
             not self.is_lm_only
+            and os.getenv("SGLANG_DISABLE_MROPE_BATCH_METADATA", "0") != "1"
             and rope_scaling is not None
             and "mrope_section" in rope_scaling
         )
@@ -370,6 +373,9 @@ class ModelConfig:
                 )
             else:
                 enable_multimodal = True
+
+        if self.is_lm_only:
+            enable_multimodal = False
 
         # Config draft model
         self._config_draft_model()

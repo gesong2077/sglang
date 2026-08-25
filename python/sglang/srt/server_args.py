@@ -6147,7 +6147,10 @@ class ServerArgs:
         run_post_process_pass(self, _page_size_default)
 
     def _handle_amd_specifics(self):
-        if is_hip():
+        # HIP raises the generic default from 8 to 16, but must not overwrite
+        # an explicit user choice (for example 64 splits for long-context
+        # decode on gfx1201).
+        if is_hip() and self.triton_attention_num_kv_splits == 8:
             self.triton_attention_num_kv_splits = 16
 
     def _handle_nccl_pre_warm(self):
@@ -7654,7 +7657,11 @@ class ServerArgs:
         except Exception:
             return False
 
-    LANGUAGE_MODEL_ONLY_ARCHITECTURES = ("MuseGlimmerForConditionalGeneration",)
+    LANGUAGE_MODEL_ONLY_ARCHITECTURES = (
+        "MuseGlimmerForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    )
 
     def _handle_language_model_only(self):
         if not self.language_model_only:

@@ -192,8 +192,6 @@ def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
         and not is_dp_attention_enabled()
         and get_exec().comm.enable_aiter_allreduce_fusion
     )
-
-
 class ScatterMode(Enum):
     """
     Suppose we have TP=4, DP=2, enable-dp-attention, and the system handles seq a,b,c,d

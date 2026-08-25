@@ -179,6 +179,9 @@ class TritonGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> tuple:
+        use_qk_l2norm_in_kernel = kwargs.pop(
+            "use_qk_l2norm_in_kernel", True
+        )
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
         if is_npu():
@@ -194,7 +197,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             initial_state=recurrent_state,
             cu_seqlens=query_start_loc,
             head_first=False,
-            use_qk_l2norm_in_kernel=True,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             **recurrent_state_indices_args,
         )
 

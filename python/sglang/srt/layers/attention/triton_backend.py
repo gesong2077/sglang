@@ -9,6 +9,8 @@ import triton
 from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_flashinfer_kv_indices_triton,
+    create_flashmla_kv_indices_triton,
+    get_num_kv_index_blocks_flashmla,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import AttentionArch, is_kimi_k3, is_qwen3_5
@@ -122,6 +124,9 @@ class ForwardMetadata:
     # PHYSICAL full-attn write target for the unified pool (eager: translated tensor;
     # cuda-graph: capture-stable buffer view). None for non-unified pools.
     out_cache_loc_full_physical: Optional[torch.Tensor] = None
+    # Dense page table used only by the opt-in AITER Unified prefill path.
+    aiter_page_table: Optional[torch.Tensor] = None
+    aiter_max_kv_len: Optional[int] = None
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -209,6 +214,23 @@ class TritonAttnBackend(AttentionBackend):
         )
         self.dcp_size = get_parallel().attn_dcp_size
         self.dcp_rank = get_parallel().attn_dcp_rank
+        self.kv_cache_dtype = model_runner.kv_cache_dtype
+        self.use_aiter_unified_prefill = (
+            get_bool_env_var("SGLANG_TRITON_USE_AITER_UNIFIED_PREFILL", "0")
+            and not self.use_mla
+            and self.dcp_size == 1
+            and not self.use_sliding_window_kv_pool
+            and self.kv_cache_dtype in (torch.float16, torch.bfloat16)
+        )
+        self.aiter_unified_prefill_min_kv_len = get_int_env_var(
+            "SGLANG_AITER_UNIFIED_PREFILL_MIN_KV_LEN", 0
+        )
+        if self.use_aiter_unified_prefill:
+            # Defer the import until the first eager prefill. Importing AITER's
+            # Triton attention module before decode CUDA-graph capture changes
+            # gfx1201's steady decode performance even though decode never calls
+            # it. The first eligible long prefill triggers this after capture.
+            self.aiter_unified_attention = None
         self.num_head = (
             model_runner.model_config.get_max_num_attention_heads()
             // get_parallel().attn_tp_size
@@ -763,6 +785,8 @@ class TritonAttnBackend(AttentionBackend):
         window_num_kv_splits = None
         window_kv_offsets = None
         swa_attn_logits = None
+        aiter_page_table = None
+        aiter_max_kv_len = None
         spec_info = forward_batch.spec_info
 
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -966,6 +990,45 @@ class TritonAttnBackend(AttentionBackend):
                 max_extend_len = int(forward_batch.extend_seq_lens.max())
             num_kv_splits = None
 
+            current_max_kv_len = (
+                forward_batch.seq_lens_cpu.max().item()
+                if forward_batch.seq_lens_cpu is not None
+                else int(forward_batch.seq_lens.max())
+            )
+            if (
+                self.use_aiter_unified_prefill
+                and current_max_kv_len
+                >= self.aiter_unified_prefill_min_kv_len
+            ):
+                # The existing Triton extend kernel consumes only the ragged
+                # prefix indices because current K/V are passed separately.
+                # AITER Unified reads all K/V from the cache, so build its full
+                # dense page table after req_to_token has been updated.
+                aiter_max_kv_len = current_max_kv_len
+                max_blocks = (
+                    aiter_max_kv_len + self.page_size - 1
+                ) // self.page_size
+                aiter_page_table = torch.empty(
+                    bs, max_blocks, dtype=torch.int32, device=self.device
+                )
+                create_flashmla_kv_indices_triton[
+                    (
+                        bs,
+                        get_num_kv_index_blocks_flashmla(
+                            max_blocks, self.page_size
+                        ),
+                    )
+                ](
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    None,
+                    aiter_page_table,
+                    self.req_to_token.stride(0),
+                    aiter_page_table.stride(0),
+                    PAGED_SIZE=self.page_size,
+                )
+
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             swa_out_cache_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
@@ -1000,6 +1063,8 @@ class TritonAttnBackend(AttentionBackend):
             swa_attn_logits=swa_attn_logits,
             swa_out_cache_loc=swa_out_cache_loc,
             out_cache_loc_full_physical=out_cache_loc_full_physical,
+            aiter_page_table=aiter_page_table,
+            aiter_max_kv_len=aiter_max_kv_len,
         )
 
     def init_cuda_graph_state(
@@ -1368,6 +1433,50 @@ class TritonAttnBackend(AttentionBackend):
             )
         ):
             causal = False
+
+        if (
+            self.use_aiter_unified_prefill
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and self.forward_metadata.aiter_page_table is not None
+            and causal
+            and score_mod is None
+            and aux_tensors is None
+            and (
+                layer.sliding_window_size is None
+                or layer.sliding_window_size <= -1
+            )
+        ):
+            if self.aiter_unified_attention is None:
+                from aiter.ops.triton.attention.unified_attention import (
+                    unified_attention,
+                )
+
+                self.aiter_unified_attention = unified_attention
+            k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            self.aiter_unified_attention(
+                q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k=k_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                ),
+                v=v_cache.view(
+                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                ),
+                out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                cu_seqlens_q=self.forward_metadata.qo_indptr,
+                seqused_k=forward_batch.seq_lens,
+                max_seqlen_q=self.forward_metadata.max_extend_len,
+                max_seqlen_k=self.forward_metadata.aiter_max_kv_len,
+                softmax_scale=layer.scaling,
+                causal=True,
+                window_size=(-1, -1),
+                block_table=self.forward_metadata.aiter_page_table,
+                softcap=logits_soft_cap,
+                q_descale=None,
+                k_descale=None,
+                v_descale=None,
+                sinks=sinks,
+            )
+            return o
 
         if self.dcp_size > 1:
             if score_mod is not None:

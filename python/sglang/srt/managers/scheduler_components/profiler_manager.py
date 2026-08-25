@@ -132,15 +132,22 @@ class SchedulerProfilerManager:
         self.profile_id = profile_id
         self.profile_prefix = profile_prefix
 
+        # Stage profiling also supports an explicit /stop_profile call.  The
+        # counters used to be initialized only when num_steps was supplied,
+        # so profile_by_stage=True without an automatic limit crashed on the
+        # first batch (None += 1).
+        if self.profile_by_stage:
+            self.profiler_prefill_ct = 0
+            self.profiler_decode_ct = 0
+            self.profiler_target_prefill_ct = num_steps
+            self.profiler_target_decode_ct = num_steps
+
         if start_step:
             self.profiler_start_forward_ct = max(start_step, self.get_forward_ct() + 1)
 
         if num_steps:
             if self.profile_by_stage:
-                self.profiler_prefill_ct = 0
-                self.profiler_decode_ct = 0
-                self.profiler_target_prefill_ct = num_steps
-                self.profiler_target_decode_ct = num_steps
+                pass
             elif start_step:
                 self.profiler_target_forward_ct = (
                     self.profiler_start_forward_ct + num_steps
@@ -399,7 +406,10 @@ class SchedulerProfilerManager:
                 if self.profiler_prefill_ct == 0:
                     self._start_profile(batch.forward_mode)
                 self.profiler_prefill_ct += 1
-                if self.profiler_prefill_ct > self.profiler_target_prefill_ct:
+                if (
+                    self.profiler_target_prefill_ct is not None
+                    and self.profiler_prefill_ct > self.profiler_target_prefill_ct
+                ):
                     if self.profile_in_progress:
                         self._stop_profile(stage=ForwardMode.EXTEND)
             elif batch.forward_mode.is_decode():
@@ -409,7 +419,10 @@ class SchedulerProfilerManager:
                         self._stop_profile(stage=ForwardMode.EXTEND)
                     self._start_profile(batch.forward_mode)
                 self.profiler_decode_ct += 1
-                if self.profiler_decode_ct > self.profiler_target_decode_ct:
+                if (
+                    self.profiler_target_decode_ct is not None
+                    and self.profiler_decode_ct > self.profiler_target_decode_ct
+                ):
                     if self.profile_in_progress:
                         self._stop_profile(stage=ForwardMode.DECODE)
             elif batch.forward_mode.is_idle():

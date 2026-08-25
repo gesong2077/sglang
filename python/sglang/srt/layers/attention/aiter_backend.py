@@ -268,6 +268,34 @@ class AiterAttnBackend(AttentionBackend):
             and self.topk == 1
             and get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1")
         )
+        # Qwen3.5 MTP feeds the accepted-token window back through
+        # DRAFT_EXTEND_V2 (normally four queries for the 3/1/4 recipe).  The
+        # legacy AITER path sends this tiny paged extend to CK
+        # mha_batch_prefill_func, whose generated kernels do not support
+        # gfx1201.  The linear top-k=1 chain is ordinary causal attention, so
+        # use the same graph-safe unified kernel as target verify.
+        self._use_unified_draft_extend = (
+            self.use_triton_unified_attention
+            and not self.use_mla
+            and self.topk == 1
+            and get_bool_env_var("SGLANG_AITER_UNIFIED_DRAFT_EXTEND", "1")
+        )
+        # The draft worker also performs one ordinary extend when a request is
+        # seeded.  Keep that small-query path off the same unsupported CK
+        # prefill kernel; the target model's bulk prefill backend is independent
+        # and remains Triton in the split-backend launch configuration.
+        self._use_unified_extend = (
+            self.use_triton_unified_attention
+            and not self.use_mla
+            and get_bool_env_var("SGLANG_AITER_UNIFIED_EXTEND", "1")
+        )
+        # The unified kernel supports native GQA.  Keeping Qwen3.5's one local
+        # KV head instead of exposing a stride-0 six-head view avoids redundant
+        # long-context KV traffic.  Retain an opt-out for quick regression
+        # isolation on architectures not covered by this gfx1201 tuning.
+        self._use_unified_native_gqa = get_bool_env_var(
+            "SGLANG_AITER_UNIFIED_NATIVE_GQA", "1"
+        )
 
         # aiter kernel related initialization
         self.max_num_partitions = (
@@ -626,22 +654,31 @@ class AiterAttnBackend(AttentionBackend):
         draft_num: int,
         page_table_dest: Optional[torch.Tensor] = None,
         swa_page_table_dest: Optional[torch.Tensor] = None,
+        kv_extra: Optional[int] = None,
     ):
-        """Build the 2D block page_table + qo_indptr for EAGLE target_verify
-        through unified_attention. Assumes the new draft K/V have already been
-        written by set_kv_buffer, so req_to_token[rp, :seq_lens[i]+draft_num]
-        covers both the prefix and the freshly committed draft tokens. Returns
-        (page_table, qo_indptr, max_q_len=draft_num).
+        """Build the 2D block page_table + qo_indptr for EAGLE unified attention.
+
+        Target verify receives prefix-only ``seq_lens`` and therefore uses the
+        default ``kv_extra=draft_num``.  DRAFT_EXTEND_V2 already carries total
+        lengths (including its newly written K/V), so it passes ``kv_extra=0``.
+        Returns ``(page_table, qo_indptr, max_q_len=draft_num, swa_page_table)``.
         """
+        if kv_extra is None:
+            kv_extra = draft_num
         device = seq_lens.device
         qo_indptr = self.qo_indptr[: bs + 1]
-        qo_indptr[: bs + 1] = torch.arange(
-            0,
-            (1 + bs) * draft_num,
-            step=draft_num,
-            dtype=torch.int32,
-            device=device,
-        )
+        if draft_num:
+            qo_indptr[: bs + 1] = torch.arange(
+                0,
+                (1 + bs) * draft_num,
+                step=draft_num,
+                dtype=torch.int32,
+                device=device,
+            )
+        else:
+            # Ordinary extend supplies non-uniform query lengths and overwrites
+            # this buffer with their cumulative sum at the call site.
+            qo_indptr.zero_()
 
         page_size = self.page_size
         max_blocks = (self.max_context_len + page_size - 1) // page_size
@@ -675,7 +712,7 @@ class AiterAttnBackend(AttentionBackend):
             page_table.stride(0),
             swa_page_table,
             swa_slot_mapping,
-            DRAFT_NUM=draft_num,
+            DRAFT_NUM=kv_extra,
             PAGE_SIZE=page_size,
             BLOCK_SIZE=BLOCK_SIZE,
             HAS_SWA=(swa_slot_mapping is not None),
@@ -1116,22 +1153,44 @@ class AiterAttnBackend(AttentionBackend):
                     run_graph=False,
                 )
             else:
-                self.indices_updater_prefill.update(
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    forward_batch.seq_lens_sum,
-                    prefix_lens=None,
-                    encoder_lens=forward_batch.encoder_lens,
-                    spec_info=forward_batch.spec_info,
-                )
-                self.forward_metadata = ForwardMetadata(
-                    self.indices_updater_prefill.kv_indptr,
-                    self.indices_updater_prefill.kv_indices,
-                    None,
-                    None,
-                    self.indices_updater_prefill.max_q_len,
-                    self.indices_updater_prefill.max_kv_len,
-                )
+                if self._use_unified_draft_extend:
+                    num_draft_tokens = self._resolve_v2_num_draft_tokens()
+                    page_table, qo_indptr, max_q_len, swa_page_table = (
+                        self._build_verify_unified_metadata(
+                            bs,
+                            forward_batch.seq_lens,
+                            forward_batch.req_pool_indices,
+                            num_draft_tokens,
+                            kv_extra=0,
+                        )
+                    )
+                    self.forward_metadata = ForwardMetadata(
+                        None,
+                        page_table,
+                        qo_indptr,
+                        None,
+                        max_q_len,
+                        page_table.shape[1] * self.page_size,
+                        max_extend_len=max_q_len,
+                        swa_page_table=swa_page_table,
+                    )
+                else:
+                    self.indices_updater_prefill.update(
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        forward_batch.seq_lens_sum,
+                        prefix_lens=None,
+                        encoder_lens=forward_batch.encoder_lens,
+                        spec_info=forward_batch.spec_info,
+                    )
+                    self.forward_metadata = ForwardMetadata(
+                        self.indices_updater_prefill.kv_indptr,
+                        self.indices_updater_prefill.kv_indices,
+                        None,
+                        None,
+                        self.indices_updater_prefill.max_q_len,
+                        self.indices_updater_prefill.max_kv_len,
+                    )
         elif forward_batch.forward_mode.is_target_verify():
             if self.use_mla:
                 draft_num = spec_info.draft_token_num
@@ -1355,35 +1414,61 @@ class AiterAttnBackend(AttentionBackend):
                     fp8_prefill_kv_indices=fp8_prefill_kv_indices,
                 )
             else:
-                self.indices_updater_prefill.update(
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    forward_batch.seq_lens_sum,
-                    prefix_lens,
-                    encoder_lens=forward_batch.encoder_lens,
-                    spec_info=None,
-                )
-
-                if self.use_sliding_window_kv_pool:
-                    # AITER attention kernels (e.g. mha_batch_prefill_func)
-                    # require int32 page indices; full_to_swa_index_mapping is
-                    # stored as int64.
-                    swa_page_table = (
-                        self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                            self.indices_updater_prefill.kv_indices
-                        ).to(torch.int32)
+                if self._use_unified_extend:
+                    page_table, qo_indptr, _, swa_page_table = (
+                        self._build_verify_unified_metadata(
+                            bs,
+                            forward_batch.seq_lens,
+                            forward_batch.req_pool_indices,
+                            0,
+                            kv_extra=0,
+                        )
+                    )
+                    qo_indptr[1 : bs + 1] = torch.cumsum(
+                        forward_batch.extend_seq_lens, dim=0
+                    )
+                    max_q_len = max(forward_batch.extend_seq_lens_cpu)
+                    self.forward_metadata = ForwardMetadata(
+                        None,
+                        page_table,
+                        qo_indptr,
+                        None,
+                        max_q_len,
+                        page_table.shape[1] * self.page_size,
+                        max_extend_len=max_q_len,
+                        swa_page_table=swa_page_table,
+                        swa_out_cache_loc=swa_out_cache_loc,
+                    )
+                else:
+                    self.indices_updater_prefill.update(
+                        forward_batch.req_pool_indices,
+                        forward_batch.seq_lens,
+                        forward_batch.seq_lens_sum,
+                        prefix_lens,
+                        encoder_lens=forward_batch.encoder_lens,
+                        spec_info=None,
                     )
 
-                self.forward_metadata = ForwardMetadata(
-                    self.indices_updater_prefill.kv_indptr,
-                    self.indices_updater_prefill.kv_indices,
-                    None,
-                    None,
-                    max(forward_batch.extend_seq_lens_cpu),
-                    forward_batch.seq_lens_cpu.max().item(),
-                    swa_page_table=swa_page_table,
-                    swa_out_cache_loc=swa_out_cache_loc,
-                )
+                    if self.use_sliding_window_kv_pool:
+                        # AITER attention kernels (e.g. mha_batch_prefill_func)
+                        # require int32 page indices; full_to_swa_index_mapping is
+                        # stored as int64.
+                        swa_page_table = (
+                            self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                                self.indices_updater_prefill.kv_indices
+                            ).to(torch.int32)
+                        )
+
+                    self.forward_metadata = ForwardMetadata(
+                        self.indices_updater_prefill.kv_indptr,
+                        self.indices_updater_prefill.kv_indices,
+                        None,
+                        None,
+                        max(forward_batch.extend_seq_lens_cpu),
+                        forward_batch.seq_lens_cpu.max().item(),
+                        swa_page_table=swa_page_table,
+                        swa_out_cache_loc=swa_out_cache_loc,
+                    )
 
     def init_cuda_graph_state(
         self,
@@ -1867,21 +1952,53 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_final_map = self.reduce_final_map
                 reduce_partial_map = self.reduce_partial_map
 
-            self.forward_metadata = ForwardMetadata(
-                kv_indptr,
-                kv_indices,
-                qo_indptr,
-                kv_last_page_len,
-                max_q_len,
-                max_kv_len,
-                work_metadata=work_metadata,
-                work_info_set=work_info_set,
-                work_indptr=work_indptr,
-                reduce_indptr=reduce_indptr,
-                reduce_final_map=reduce_final_map,
-                reduce_partial_map=reduce_partial_map,
-                num_kv_splits=num_kv_splits,
-            )
+            if self._use_unified_draft_extend and not self.use_mla:
+                max_num_blocks_per_seq = (
+                    self.max_context_len + self.page_size - 1
+                ) // self.page_size
+                page_table = self.cuda_graph_page_table[:bs]
+                swa_page_table = None
+                if self.use_sliding_window_kv_pool:
+                    swa_page_table = self.cuda_graph_swa_page_table.view(
+                        -1, max_num_blocks_per_seq
+                    )[:bs]
+                page_table, qo_indptr, max_q_len, swa_page_table = (
+                    self._build_verify_unified_metadata(
+                        bs,
+                        seq_lens,
+                        req_pool_indices,
+                        num_tokens_per_req,
+                        page_table_dest=page_table,
+                        swa_page_table_dest=swa_page_table,
+                        kv_extra=0,
+                    )
+                )
+                self.forward_metadata = ForwardMetadata(
+                    None,
+                    page_table,
+                    qo_indptr,
+                    kv_last_page_len,
+                    max_q_len,
+                    max_num_blocks_per_seq * self.page_size,
+                    max_extend_len=max_q_len,
+                    swa_page_table=swa_page_table,
+                )
+            else:
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    kv_last_page_len,
+                    max_q_len,
+                    max_kv_len,
+                    work_metadata=work_metadata,
+                    work_info_set=work_info_set,
+                    work_indptr=work_indptr,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    num_kv_splits=num_kv_splits,
+                )
         else:
             raise ValueError("Invalid forward mode")
 
@@ -2256,8 +2373,7 @@ class AiterAttnBackend(AttentionBackend):
                     o = torch.empty_like(q)
 
                 # target_verify goes through unified_attention when topk == 1
-                # (the linear draft chain gives a pure causal mask). MLA and
-                # draft_extend still use the legacy extend_attention_fwd path.
+                # (the linear draft chain gives a pure causal mask).
                 if (
                     self._use_unified_verify
                     and forward_batch.forward_mode.is_target_verify()
@@ -2285,10 +2401,13 @@ class AiterAttnBackend(AttentionBackend):
                     v_unified = v_cache.view(
                         -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                     )
-                    if layer.tp_k_head_num == 1 and layer.tp_q_head_num > 1:
-                        # Qwen3.5 can replicate one KV head across multiple TP ranks.
-                        # Present the local KV head as per-Q-head stride-0 views so
-                        # target_verify uses the same local head mapping as the model.
+                    if (
+                        not self._use_unified_native_gqa
+                        and layer.tp_k_head_num == 1
+                        and layer.tp_q_head_num > 1
+                    ):
+                        # Compatibility fallback: expose the shared local KV head
+                        # as per-Q-head stride-0 views.
                         k_unified = k_unified.expand(-1, -1, layer.tp_q_head_num, -1)
                         v_unified = v_unified.expand(-1, -1, layer.tp_q_head_num, -1)
 
@@ -2336,6 +2455,129 @@ class AiterAttnBackend(AttentionBackend):
                     1.0,  # v_scale
                     layer.scaling,
                     logit_cap=layer.logit_cap,
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+            if (
+                self._use_unified_draft_extend
+                and forward_batch.forward_mode.is_draft_extend_v2()
+            ):
+                if layer.qk_head_dim != layer.v_head_dim:
+                    o = q.new_empty(
+                        (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                    )
+                else:
+                    o = torch.empty_like(q)
+
+                k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(
+                    layer.layer_id
+                )
+                page_table = self.forward_metadata.kv_indices
+                window_size = (-1, -1)
+                if (
+                    layer.sliding_window_size is not None
+                    and layer.sliding_window_size > -1
+                ):
+                    window_size = (layer.sliding_window_size - 1, 0)
+                    if self.forward_metadata.swa_page_table is not None:
+                        page_table = self.forward_metadata.swa_page_table
+
+                k_unified = k_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                )
+                v_unified = v_cache.view(
+                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                )
+                if (
+                    not self._use_unified_native_gqa
+                    and layer.tp_k_head_num == 1
+                    and layer.tp_q_head_num > 1
+                ):
+                    k_unified = k_unified.expand(
+                        -1, -1, layer.tp_q_head_num, -1
+                    )
+                    v_unified = v_unified.expand(
+                        -1, -1, layer.tp_q_head_num, -1
+                    )
+
+                unified_attention(
+                    q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    k=k_unified,
+                    v=v_unified,
+                    out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    cu_seqlens_q=self.forward_metadata.qo_indptr,
+                    seqused_k=forward_batch.seq_lens,
+                    max_seqlen_q=self.forward_metadata.max_q_len,
+                    max_seqlen_k=page_table.shape[1] * self.page_size,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                    window_size=window_size,
+                    block_table=page_table,
+                    softcap=layer.logit_cap,
+                    q_descale=None,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    sinks=sinks,
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+            if self._use_unified_extend and forward_batch.forward_mode.is_extend():
+                if layer.qk_head_dim != layer.v_head_dim:
+                    o = q.new_empty(
+                        (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                    )
+                else:
+                    o = torch.empty_like(q)
+
+                k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(
+                    layer.layer_id
+                )
+                page_table = self.forward_metadata.kv_indices
+                window_size = (-1, -1)
+                if (
+                    layer.sliding_window_size is not None
+                    and layer.sliding_window_size > -1
+                ):
+                    window_size = (layer.sliding_window_size - 1, 0)
+                    if self.forward_metadata.swa_page_table is not None:
+                        page_table = self.forward_metadata.swa_page_table
+
+                k_unified = k_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                )
+                v_unified = v_cache.view(
+                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                )
+                if (
+                    not self._use_unified_native_gqa
+                    and layer.tp_k_head_num == 1
+                    and layer.tp_q_head_num > 1
+                ):
+                    k_unified = k_unified.expand(
+                        -1, -1, layer.tp_q_head_num, -1
+                    )
+                    v_unified = v_unified.expand(
+                        -1, -1, layer.tp_q_head_num, -1
+                    )
+
+                unified_attention(
+                    q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    k=k_unified,
+                    v=v_unified,
+                    out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    cu_seqlens_q=self.forward_metadata.qo_indptr,
+                    seqused_k=forward_batch.seq_lens,
+                    max_seqlen_q=self.forward_metadata.max_q_len,
+                    max_seqlen_k=page_table.shape[1] * self.page_size,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                    window_size=window_size,
+                    block_table=page_table,
+                    softcap=layer.logit_cap,
+                    q_descale=None,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    sinks=sinks,
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 

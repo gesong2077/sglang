@@ -1,3 +1,4 @@
+import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -19,10 +20,21 @@ from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
-from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import (
+    is_cpu,
+    is_cuda,
+    is_gfx1201_supported,
+    is_hip,
+    is_npu,
+    is_xpu,
+)
 from sglang.srt.utils.common import rank0_log
 
 _is_hip = is_hip()
+_use_rdna4_fused_gdn_prefill_prep = (
+    is_gfx1201_supported()
+    and os.environ.get("SGLANG_DISABLE_RDNA4_FUSED_GDN_PREFILL_PREP", "0") != "1"
+)
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk_delta_h import (
@@ -31,6 +43,7 @@ if not is_cpu():
 
 if is_cuda() or is_hip() or is_xpu():
     from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
+        fused_gdn_prefill_prep,
         fused_qkv_split_gdn_prefill,
     )
 
@@ -554,6 +567,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
+            debug_mtp = (
+                os.environ.get("SGLANG_DEBUG_MTP_INPUTS", "0") == "1"
+                and layer.layer_id == 0
+            )
+            if debug_mtp:
+                rank0_log(
+                    "MTP_DEBUG gdn0 input "
+                    f"mixed_shape={tuple(mixed_qkv.shape)} stride={mixed_qkv.stride()} "
+                    f"a_stride={a.stride()} b_stride={b.stride()} "
+                    f"input_finite={torch.isfinite(mixed_qkv).view(seq_len, -1).all(1).tolist()} "
+                    f"a_finite={torch.isfinite(a).view(seq_len, -1).all(1).tolist()} "
+                    f"b_finite={torch.isfinite(b).view(seq_len, -1).all(1).tolist()}"
+                )
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
@@ -571,6 +597,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_parent_token=retrieve_parent_token,
             )
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+            if debug_mtp:
+                rank0_log(
+                    "MTP_DEBUG gdn0 conv "
+                    f"reshaped_stride={mixed_qkv_reshaped.stride()} "
+                    f"output_stride={mixed_qkv.stride()} "
+                    f"finite={torch.isfinite(mixed_qkv).view(seq_len, -1).all(1).tolist()} "
+                    f"norms={mixed_qkv.float().norm(dim=-1).tolist()} "
+                    f"cache_indices={cache_indices[:batch_size].tolist()} "
+                    f"intermediate_indices={intermediate_state_indices[:batch_size].tolist()} "
+                    f"retrieve_next={retrieve_next_token.tolist() if retrieve_next_token is not None else None} "
+                    f"retrieve_sibling={retrieve_next_sibling.tolist() if retrieve_next_sibling is not None else None} "
+                    f"retrieve_parent={retrieve_parent_token.tolist() if retrieve_parent_token is not None else None}"
+                )
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if forward_metadata.has_mamba_track_mask:
@@ -595,7 +634,33 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         actual_seq_len = mixed_qkv.shape[0]
         qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        if (is_cuda() or is_hip() or is_xpu()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
+        use_fused_gdn_prep = bool(
+            _use_rdna4_fused_gdn_prefill_prep
+            and not is_target_verify
+            # The fused preparation wins for cold short prefills.  At 4K and
+            # 8K its larger two-dimensional grid costs more than the launches
+            # it removes, so keep the existing path there.
+            and 0 < actual_seq_len <= 2048
+            and layer.num_q_heads == layer.num_k_heads == 8
+            and layer.num_v_heads == 24
+            and layer.head_q_dim == layer.head_k_dim == layer.head_v_dim == 128
+            and qkv_dim == 5120
+            and mixed_qkv.dtype == torch.bfloat16
+            and mixed_qkv.stride(1) == 1
+        )
+        if use_fused_gdn_prep:
+            query, key, value, g, beta = fused_gdn_prefill_prep(
+                mixed_qkv,
+                a,
+                b,
+                layer.A_log,
+                layer.dt_bias,
+                layer.num_k_heads,
+                layer.num_v_heads,
+                layer.head_k_dim,
+                layer.head_v_dim,
+            )
+        elif (is_cuda() or is_hip() or is_xpu()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
             query, key, value = fused_qkv_split_gdn_prefill(
                 mixed_qkv,
                 layer.num_q_heads,
@@ -616,6 +681,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
             value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
         if is_target_verify:
+            if debug_mtp:
+                selected_state = ssm_states[cache_indices[:batch_size]]
+                rank0_log(
+                    "MTP_DEBUG gdn0 recurrent_input "
+                    f"q_finite={torch.isfinite(query).view(seq_len, -1).all(1).tolist()} "
+                    f"k_finite={torch.isfinite(key).view(seq_len, -1).all(1).tolist()} "
+                    f"v_finite={torch.isfinite(value).view(seq_len, -1).all(1).tolist()} "
+                    f"state_shape={tuple(ssm_states.shape)} state_stride={ssm_states.stride()} "
+                    f"state_finite={torch.isfinite(selected_state).flatten(1).all(1).tolist()} "
+                    f"inter_shape={tuple(intermediate_state_cache.shape) if intermediate_state_cache is not None else None} "
+                    f"inter_stride={intermediate_state_cache.stride() if intermediate_state_cache is not None else None}"
+                )
             # ReplaySSM verify protocols: fold-every-commit (ring-write during
             # verify, fold on commit), circular ring, or the snapshotting
             # fallback when neither ring is allocated.
@@ -684,8 +761,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     cache_steps=forward_batch.spec_info.draft_token_num,
                     retrieve_parent_token=retrieve_parent_token,
                 )
+            if debug_mtp:
+                rank0_log(
+                    "MTP_DEBUG gdn0 recurrent_output "
+                    f"shape={tuple(core_attn_out.shape)} "
+                    f"finite={torch.isfinite(core_attn_out).view(seq_len, -1).all(1).tolist()} "
+                    f"norms={core_attn_out.float().view(seq_len, -1).norm(dim=-1).tolist()}"
+                )
         else:
-            g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            if not use_fused_gdn_prep:
+                g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
@@ -702,6 +787,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 state_checkpoint_every_n_tokens=(
                     forward_metadata.state_checkpoint_every_n_tokens
                 ),
+                use_qk_l2norm_in_kernel=not use_fused_gdn_prep,
             )
 
             if is_npu() and last_recurrent_state is not None:

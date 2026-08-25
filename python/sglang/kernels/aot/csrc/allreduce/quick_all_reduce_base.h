@@ -322,7 +322,7 @@ __quickreduce_device_inline__ void set_sync_flag(uint32_t* flag_ptr, uint32_t fl
 }
 
 __quickreduce_device_inline__ void wait_sync_flag(uint32_t* flag_ptr, uint32_t flag) {
-  while (__atomic_load_n(flag_ptr, __ATOMIC_RELAXED) != flag) {
+  while (__atomic_load_n(flag_ptr, __ATOMIC_ACQUIRE) != flag) {
   }
 }
 
