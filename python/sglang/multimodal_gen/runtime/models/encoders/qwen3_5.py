@@ -290,11 +290,13 @@ class Qwen3_5Model(TextEncoder):
 
     def __init__(self, config: Qwen3_5EncoderConfig):
         super().__init__(config)
-        if config.quant_config is not None:
-            raise NotImplementedError(
-                "Qwen3.5 diffusion encoder quantization is not supported"
-            )
         self.language_model = Qwen3_5TextModel(config.arch_config.text_config)
+        if config.quant_config is not None:
+            from sglang.multimodal_gen.runtime.layers.quantization.moss_w8a8 import (
+                install_moss_projections,
+            )
+
+            install_moss_projections(self, config.quant_config, text_only=True)
 
     @staticmethod
     def should_materialize_checkpoint_weight(name: str) -> bool:

@@ -300,6 +300,8 @@ class _Block(nn.Module):
         shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = modulation.unbind(1)
         y = _norm_modulate(self.norm1, x, scale_a, shift_a)
         dtype = self.proj["q"].weight.dtype
+        if dtype == torch.int8:
+            dtype = self.proj["q"].params_dtype
         y = y.to(dtype)
         q = _norm_rope(self.q_norm, self.proj["q"](y), rope, self.heads)
         k = _norm_rope(self.k_norm, self.proj["k"](y), rope, self.heads)
@@ -403,8 +405,6 @@ class MOSSImageTransformer(BaseDiT, LayerwiseOffloadableModuleMixin):
         self, config: MOSSImageDiTConfig, hf_config=None, quant_config=None, **kwargs
     ):
         super().__init__(config, hf_config or {}, **kwargs)
-        if quant_config is not None:
-            raise NotImplementedError("MOSSImage DiT quantization is not implemented")
         arch = self.config
         dim, ffn_dim, num_heads = arch.dim, arch.ffn_dim, arch.num_heads
         num_layers, text_dim = arch.num_layers, arch.text_dim
@@ -437,6 +437,12 @@ class MOSSImageTransformer(BaseDiT, LayerwiseOffloadableModuleMixin):
         self.final_norm_video = _RMSNorm(dim)
         self.final_linear_video = nn.Linear(dim, latent_channels, bias=False)
         self.video_head_modulation = nn.Linear(dim, 2 * dim)
+        if quant_config is not None:
+            from sglang.multimodal_gen.runtime.layers.quantization.moss_w8a8 import (
+                install_moss_projections,
+            )
+
+            install_moss_projections(self, quant_config)
 
     def _unpad_text(self, encoder_hidden_states, encoder_attention_mask):
         if (
@@ -546,6 +552,12 @@ class MOSSImageTransformer(BaseDiT, LayerwiseOffloadableModuleMixin):
         ).reshape(-1)
         times = times.expand(batch)
         # Training computes the sinusoid in float64 and feeds float32 into its MLP.
+        embedding_device = times.device
+        if (
+            times.device.type == "xpu"
+            and not torch.xpu.get_device_properties(times.device).has_fp64
+        ):
+            times = times.cpu()
         half = self.config.freq_dim // 2
         freq = 10000 ** (
             -torch.arange(half, device=times.device, dtype=torch.float64) / half
@@ -553,7 +565,9 @@ class MOSSImageTransformer(BaseDiT, LayerwiseOffloadableModuleMixin):
         phase = times.double()[:, None] * freq
         embedding = torch.cat((phase.cos(), phase.sin()), -1).float()
         time = self.time_embedding(
-            embedding.to(self.time_embedding[0].weight.dtype)
+            embedding.to(
+                device=embedding_device, dtype=self.time_embedding[0].weight.dtype
+            )
         ).float()
         mod = self.shared_block_modulation(
             time.to(self.shared_block_modulation.weight.dtype)

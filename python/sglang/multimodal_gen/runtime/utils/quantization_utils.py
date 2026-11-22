@@ -543,6 +543,12 @@ def _load_quant_cls(quant_cfg: dict):
     quant_method = _resolve_quant_method_name(quant_cfg)
     if not quant_method:
         raise ValueError("Missing quant_method in quantization config.")
+    if quant_method == "convrot_int8" and "layer_groups" in quant_cfg:
+        from sglang.multimodal_gen.runtime.layers.quantization.moss_w8a8 import (
+            SerializedConvRotConfig,
+        )
+
+        return SerializedConvRotConfig
     if (
         quant_method == "compressed-tensors"
         and quant_cfg.get("format") == "pack-quantized"
