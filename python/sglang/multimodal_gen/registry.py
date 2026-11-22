@@ -575,6 +575,43 @@ def _get_diffusers_model_info(
     )
 
 
+def _is_native_moss_w8a8_package(model_path: str) -> bool:
+    # GPTQ can describe the training algorithm of a component stored in the
+    # native W8A8 layout. A directory name alone cannot identify its format.
+    index = load_dict(os.path.join(model_path, "model_index.json"))
+    if index.get("_class_name") != "MOSSImagePipeline":
+        return False
+
+    from sglang.multimodal_gen.runtime.layers.quantization.compressed_int8 import (
+        CompressedInt8Config,
+    )
+    from sglang.multimodal_gen.runtime.layers.quantization.moss_w8a8 import (
+        SerializedConvRotConfig,
+    )
+    from sglang.srt.utils import is_xpu
+
+    if not is_xpu():
+        return False
+    found = False
+    for component in ("text_encoder", "transformer"):
+        config = load_dict(os.path.join(model_path, component, "config.json"))
+        quant = config.get("quantization_config")
+        if not quant:
+            continue
+        cls = {
+            "compressed-tensors": CompressedInt8Config,
+            "convrot_int8": SerializedConvRotConfig,
+        }.get(quant.get("quant_method"))
+        if cls is None:
+            return False
+        try:
+            cls.from_config(quant)
+        except (KeyError, TypeError, ValueError):
+            return False
+        found = True
+    return found
+
+
 @lru_cache(maxsize=1)
 def get_model_info(
     model_path: str,
@@ -626,7 +663,7 @@ def get_model_info(
 
     # Detect quantized models and fallback to diffusers
     is_quantized = any(q in model_path.lower() for q in ["-4bit", "-awq", "-gptq"])
-    if is_quantized and backend != Backend.DIFFUSERS:
+    if is_quantized and not _is_native_moss_w8a8_package(model_path):
         logger.info(
             "Detected a quantized model format ('%s'). "
             "The native sglang-diffusion engine currently only supports BF16/FP16. "

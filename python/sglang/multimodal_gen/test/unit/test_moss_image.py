@@ -166,6 +166,39 @@ def test_dit_skips_requested_layer_and_restores_full_forward():
     assert not torch.equal(expected, skipped)
 
 
+@pytest.mark.parametrize(
+    "bits,expected", [(8, "MOSSImagePipeline"), (4, "DiffusersPipeline")]
+)
+def test_gptq_directory_name_uses_serialized_moss_format(
+    tmp_path, monkeypatch, bits, expected
+):
+    from sglang.multimodal_gen import registry
+    from sglang.srt import utils
+
+    monkeypatch.setattr(utils, "is_xpu", lambda: True)
+    path = tmp_path / "MOSS-Image-SFT-encoder-gptq"
+    encoder = path / "text_encoder"
+    encoder.mkdir(parents=True)
+    (path / "transformer").mkdir()
+    (path / "vae").mkdir()
+    index = {"_class_name": "MOSSImagePipeline", "_diffusers_version": "0.38.0"}
+    (path / "model_index.json").write_text(json.dumps(index))
+    common = {"type": "int", "num_bits": bits, "symmetric": True}
+    quant = {
+        "quant_method": "compressed-tensors",
+        "format": "int-quantized",
+        "config_groups": {
+            "group": {
+                "targets": ["language_model.layers.0.mlp.down_proj"],
+                "weights": dict(common, strategy="channel", dynamic=False),
+                "input_activations": dict(common, strategy="token", dynamic=True),
+            }
+        },
+    }
+    (encoder / "config.json").write_text(json.dumps({"quantization_config": quant}))
+    assert registry.get_model_info(str(path)).pipeline_cls.__name__ == expected
+
+
 @pytest.mark.parametrize("name", ["Base", "SFT"])
 def test_model_identifiers_resolve_native_configs(name, monkeypatch, tmp_path):
     """Resolve registered model IDs and local snapshots through native configs."""
