@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import Callable, Optional
 
 import torch
@@ -21,11 +22,12 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_xpu
 
 __all__ = ["CompressedTensorsW8A8Int8", "NPUCompressedTensorsW8A8Int8"]
 
 _is_cuda = is_cuda()
+_is_xpu = is_xpu()
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
 
@@ -124,6 +126,12 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
         else:
             raise ValueError(f"Unknown quantization strategy {self.strategy}")
 
+        if _is_xpu and os.environ.get("SGLANG_XPU_W8A8_ONEDNN") == "1":
+            # One-time exact widening, rather than a conversion on every forward.
+            layer.weight_scale = Parameter(
+                layer.weight_scale.float().contiguous(), requires_grad=False
+            )
+
         # INPUT SCALE
         if self.is_static_input_scheme and hasattr(layer, "input_scale"):
             if self.input_symmetric:
@@ -170,6 +178,16 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
     def apply_weights(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
     ) -> torch.Tensor:
+        if _is_xpu:
+            if self.is_static_input_scheme or not self.input_symmetric:
+                raise NotImplementedError(
+                    "XPU INT8 supports dynamic symmetric activations only"
+                )
+            from sglang.srt.hardware_backend.xpu.quantization.w8a8_int8_kernels import (
+                dynamic_w8a8_linear,
+            )
+
+            return dynamic_w8a8_linear(x, layer.weight, layer.weight_scale, bias)
         # TODO: add cutlass_scaled_mm_azp support
         x_q, x_scale = per_token_quant_int8(x)
 

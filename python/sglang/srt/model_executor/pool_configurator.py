@@ -961,9 +961,12 @@ def compute_swa_request_cap(
         )
     else:
         chunks_in_flight = 1 if get_schedule().disable_overlap_schedule else 2
+        extra_chunks = envs.SGLANG_SWA_PREFILL_EXTRA_CHUNKS.get()
+        if extra_chunks < 0:
+            raise ValueError("SGLANG_SWA_PREFILL_EXTRA_CHUNKS must be non-negative")
         return (
             per_request * num_reqs
-            + chunks_in_flight * get_schedule().chunked_prefill_size
+            + (chunks_in_flight + extra_chunks) * get_schedule().chunked_prefill_size
             + page_size
         )
 

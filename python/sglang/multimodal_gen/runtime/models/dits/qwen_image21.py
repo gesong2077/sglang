@@ -65,6 +65,13 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 )
 
 _is_cuda = current_platform.is_cuda()
+_is_xpu = current_platform.is_xpu()
+if _is_xpu:
+    from sglang.kernels.ops.diffusion.rope import qwen_image21_b60 as b60
+
+_B60_QK = BitExactFusionGate("B60 Q/K RMSNorm + RoPE", per_signature=True)
+_B60_RESIDUAL = BitExactFusionGate("B60 BF16 gated residual")
+_B60_SILU = BitExactFusionGate("B60 BF16 SiLU-mul")
 
 logger = init_logger(__name__)
 _ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 complex RoPE")
@@ -170,6 +177,13 @@ def apply_qk_norm(x, norm):
 
 
 def apply_qk_norm_rope(x, norm, rope):
+    if _is_xpu and b60.can_fuse_qk(x, norm.weight, rope):
+        return _B60_QK.run(
+            lambda: b60.qk_norm_rope(x, norm.weight, rope, norm.variance_epsilon),
+            lambda: apply_rope(norm(x), rope),
+            sig=(x.device, x.shape, norm.variance_epsilon),
+            logger=logger,
+        )
     fused = None
     if (
         _is_cuda
@@ -262,6 +276,23 @@ def attend_past_prefix_pad(attn, q, k, v, prefix_pad, out):
 def cat_outputs(outputs, dim=0):
     # torch.cat on a one-element list degrades to a full copy of the tensor.
     return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=dim)
+
+
+def apply_gated_residual(x, update, gate):
+    if (
+        _is_xpu
+        and b60.can_fuse_pair(x, update)
+        and gate.shape == (1, 1, x.shape[-1])
+        and gate.device == x.device
+        and gate.dtype == x.dtype
+        and gate.is_contiguous()
+    ):
+        return _B60_RESIDUAL.run(
+            lambda: b60.fused_pointwise(x, update, gate),
+            lambda: residual_gate_add(x, update, gate),
+            logger=logger,
+        )
+    return residual_gate_add(x, update, gate)
 
 
 def apply_modulation(x, norm, scale):
@@ -368,6 +399,26 @@ class QwenImage21FeedForward(nn.Module):
             prefix=f"{prefix}.out",
         )
 
+    @torch.no_grad()
+    def pad_b60_down_weight(self):
+        # Avoid the 12 KiB row stride of a contiguous TP2 BF16 down projection.
+        # Keep the Parameter and logical shape used by checkpoint/LoRA loaders.
+        if not _is_xpu or type(self.out) is not RowParallelLinear:
+            return
+        if not isinstance(self.out.quant_method, UnquantizedLinearMethod):
+            return
+        weight = self.out.weight
+        if (
+            weight.shape != (4096, 6144)
+            or not b60.supports_b60(weight)
+            or not weight.is_contiguous()
+        ):
+            return
+        rows, cols = weight.shape
+        padded = weight.new_empty(rows, cols + 64)[:, :cols]
+        padded.copy_(weight)
+        weight.data = padded
+
     def pack_gate_up_weights(self):
         """Share one [2F, C] INT8 weight and [2F, 1] scale storage between gate_layer
         and proj so the comfy_kitchen path projects both with one GEMM.
@@ -424,6 +475,7 @@ class QwenImage21FeedForward(nn.Module):
         # re-share them once the weights are back on the GPU.
         module = super()._apply(fn, recurse)
         self.pack_gate_up_weights()
+        self.pad_b60_down_weight()
         return module
 
     def forward(self, x):
@@ -435,6 +487,24 @@ class QwenImage21FeedForward(nn.Module):
                 x, *packed, self.gate_layer.quant_method.group_size, self.out
             )
         gate, value = self.gate_layer(x)[0], self.proj(x)[0]
+        if _is_xpu and b60.can_fuse_pair(gate, value):
+            # Write the activation in the measured BF16 TP2 down-GEMM layout.
+            # Both leading dimensions then avoid a 12 KiB row stride.
+            pad = (
+                32
+                if gate.shape == (1, 4096, 6144)
+                and type(self.out) is RowParallelLinear
+                and self.out.tp_size == 2
+                and isinstance(self.out.quant_method, UnquantizedLinearMethod)
+                and self.out.weight.stride() == (6208, 1)
+                else 0
+            )
+            hidden = _B60_SILU.run(
+                lambda: b60.fused_pointwise(gate, value, output_row_padding=pad),
+                lambda: nn.functional.silu(gate) * value,
+                logger=logger,
+            )
+            return self.out(hidden)[0]
         fused = None
         if (
             _is_cuda
@@ -905,8 +975,8 @@ class QwenImage21TransformerBlock(nn.Module):
             caches,
             prefix_pad,
         )
-        hidden_states = residual_gate_add(hidden_states, attention, gate1)
-        hidden_states = residual_gate_add(
+        hidden_states = apply_gated_residual(hidden_states, attention, gate1)
+        hidden_states = apply_gated_residual(
             hidden_states,
             self.img_mlp(apply_modulation(hidden_states, self.img_norm2, scale2)),
             gate2,
@@ -914,8 +984,8 @@ class QwenImage21TransformerBlock(nn.Module):
         for state, attention in zip(prefix_states, prefix_attentions, strict=True):
             if attention is not None:
                 _, pg1, ps2, pg2 = prefix_modulation
-                prefix = residual_gate_add(state["hidden_states"], attention, pg1)
-                state["hidden_states"] = residual_gate_add(
+                prefix = apply_gated_residual(state["hidden_states"], attention, pg1)
+                state["hidden_states"] = apply_gated_residual(
                     prefix,
                     self.img_mlp(apply_modulation(prefix, self.img_norm2, ps2)),
                     pg2,
@@ -1036,6 +1106,7 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
         for block in self.transformer_blocks:
             block.attn.pack_qkv_weights()
             block.img_mlp.pack_gate_up_weights()
+            block.img_mlp.pad_b60_down_weight()
 
     def prepare_lora_adapter(self, adapter):
         return _split_fused_gate_up_lora(

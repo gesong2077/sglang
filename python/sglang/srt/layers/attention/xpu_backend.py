@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import msgspec
@@ -33,6 +34,12 @@ if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+import os as _muse_os
+_muse_prefill_library = _muse_os.environ.get("SGLANG_XPU_MUSE_WINDOW_FA_LIB")
+_muse_window_shadow = _muse_os.environ.get("SGLANG_XPU_MUSE_WINDOW_SHADOW")
+if _muse_prefill_library:
+    from sglang.srt.hardware_backend.xpu.kernels.muse_window_prefill import try_prefill, verify_shadow
 
 from sgl_kernel import (
     flash_mla_decode,
@@ -204,6 +211,11 @@ class XPUAttentionBackend(AttentionBackend):
         self.num_splits = (
             1 if get_exec().deterministic.enable_deterministic_inference else 0
         )
+        # Opt-in device tuning; preserve the deterministic reduction override.
+        decode_splits = int(os.environ.get("SGLANG_XPU_DECODE_NUM_SPLITS", "0"))
+        if decode_splits < 0:
+            raise ValueError("SGLANG_XPU_DECODE_NUM_SPLITS must be non-negative")
+        self.decode_num_splits = self.num_splits or decode_splits
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         if self.is_encoder_decoder:
             from sglang.srt.model_executor.cuda_graph_config import (
@@ -895,6 +907,30 @@ class XPUAttentionBackend(AttentionBackend):
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+            window_candidate = None
+            if (
+                _muse_prefill_library and window_size == (2047, 0) and q.shape[0] >= 2048
+                # The experimental dense-prefill launch is verified for a fresh KV
+                # sequence. Keep cached chunks on the backend that owns SWA paging.
+                and forward_batch.extend_prefix_lens_cpu is not None
+                and len(forward_batch.extend_prefix_lens_cpu) == 1
+                and forward_batch.extend_prefix_lens_cpu[0] == 0
+                and max_seqlen_q == q.shape[0] and causal_arg and not layer.is_cross_attention
+                and not use_local_attn and not use_cascade_attn and not self.is_encoder_decoder
+                and forward_batch.forward_mode.is_extend() and forward_batch.spec_info is None
+                and forward_batch._attn_output is None and forward_batch.batch_size == 1
+                and q.is_contiguous()
+                and sinks is None and not layer.logit_cap and bidirectional_block_ids is None
+                and k_descale is None and v_descale is None and layer.v_head_dim == 128
+            ):
+                window_candidate = try_prefill(
+                    _muse_prefill_library, q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    key_cache, value_cache, page_table, cu_seqlens_q, cache_seqlens,
+                    layer.scaling, window_size,
+                )
+                if window_candidate is not None and not _muse_window_shadow:
+                    return window_candidate.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
             result = flash_attn_with_kvcache(
                 q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache=key_cache,
@@ -929,6 +965,9 @@ class XPUAttentionBackend(AttentionBackend):
                 ),
                 **kwargs,
             )
+
+            if window_candidate is not None and _muse_window_shadow:
+                verify_shadow(window_candidate, result, layer.layer_id, cache_seqlens, _muse_window_shadow)
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
@@ -1453,7 +1492,7 @@ class XPUAttentionBackend(AttentionBackend):
             # Only the MHA kernels below take num_splits. The MLA path calls
             # flash_mla_decode, whose own num_kv_splits already defaults to 1
             # (no split-KV), so it needs no deterministic override here.
-            kwargs["num_splits"] = self.num_splits
+            kwargs["num_splits"] = self.decode_num_splits
 
             key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             key_cache = key_cache.view(

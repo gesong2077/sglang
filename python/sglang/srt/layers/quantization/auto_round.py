@@ -14,10 +14,11 @@ from sglang.srt.layers.quantization.utils import get_scalar_types
 ScalarType, scalar_types = get_scalar_types()
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_npu
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_npu, is_xpu
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
 _CPU_AMX_REQUIRED_MSG = (
@@ -152,7 +153,7 @@ class AutoRoundConfig(QuantizationConfig):
             name for name, keys in gptq_config_keys.items() if not has_any_key(keys)
         )
 
-        return cls(
+        quant_config = cls(
             weight_bits=cls.get_from_keys(config, ["bits"]),
             group_size=cls.get_from_keys(config, ["group_size"]),
             sym=cls.get_from_keys(config, ["sym"]),
@@ -179,6 +180,10 @@ class AutoRoundConfig(QuantizationConfig):
             static_groups=cls.get_from_keys_or(config, ["static_groups"], False),
             gptq_defaulted_config_keys=gptq_defaulted_config_keys,
         )
+        quant_config.update_packed_modules_mapping(
+            config.get("packed_modules_mapping", {})
+        )
+        return quant_config
 
     def get_scaled_act_names(self) -> list[str]:
         """Returns the activation function names that should be post-scaled.
@@ -478,6 +483,21 @@ class AutoRoundConfig(QuantizationConfig):
             sym,
         )
         self.log_gptq_default_assumptions_once()
+        if _is_xpu:
+            from sglang.srt.layers.quantization.gptq import GPTQXPUConfig
+
+            if weight_bits != 4:
+                raise NotImplementedError("AutoRound on XPU requires 4-bit GPTQ weights.")
+            if isinstance(layer, FusedMoE):
+                raise NotImplementedError("AutoRound GPTQ MoE is not supported on XPU.")
+            if is_linear:
+                quant_args = GPTQXPUConfig(
+                    **self.get_gptq_config_kwargs(weight_bits, group_size),
+                )
+                layer.scheme = quant_args.get_linear_scheme(layer)
+                return GPTQLinearMethod(quant_args)
+            return None
+
         if _is_npu:
             quant_args = GPTQAscendConfig(
                 **self.get_gptq_config_kwargs(weight_bits, group_size),

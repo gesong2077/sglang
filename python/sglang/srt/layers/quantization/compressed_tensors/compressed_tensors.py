@@ -1081,7 +1081,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Note: NPU devices do not support min_capability function
         if _is_xpu:
             if not isinstance(
-                scheme, (CompressedTensorsW8A8Fp8, XPUCompressedTensorsWNA16)
+                scheme, (CompressedTensorsW8A8Fp8, XPUCompressedTensorsWNA16, CompressedTensorsW8A8Int8)
             ):
                 raise RuntimeError(
                     f"{scheme.__class__.__name__} is not supported on XPU "

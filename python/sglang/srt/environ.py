@@ -728,6 +728,9 @@ class Envs:
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
+    # Optional capacity headroom for overlapped chunked prefill. This changes
+    # pool sizing only; it does not change the attention window or eviction.
+    SGLANG_SWA_PREFILL_EXTRA_CHUNKS = EnvInt(0)
     # The tree-core registry falls back to Python for:
     # - Session-aware caching.
     # - C128 or other unsupported components.

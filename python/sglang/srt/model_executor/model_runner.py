@@ -2118,6 +2118,27 @@ class ModelRunner:
         # runners may reuse backing objects. Never leak an auxiliary result from
         # a previous replay into a request with no observer state.
         logits_output.auxiliary_device_output = None
+        compact_ids = logits_output.xpu_compact_token_ids
+        if compact_ids is not None:
+            from sglang.srt.hardware_backend.xpu.kernels.muse_compact_greedy import (eligible, gather_full, shadow_check)
+            from sglang.srt.utils.async_probe import maybe_detect_nan
+            tp = get_parallel().tp_group
+            raw_logits = logits_output.next_token_logits
+            assert raw_logits.shape == (1, 101056) and raw_logits.dtype == torch.bfloat16
+            use_compact = eligible(self, forward_batch)
+            shadow_check(raw_logits, compact_ids, tp.rank_in_group, tp.device_group, use_compact)
+            if use_compact:
+                maybe_detect_nan(raw_logits, "sampler: local next_token_logits")
+                # Match the sampler ownership: do not expose the graph storage
+                # to the asynchronous next request or CPU result copy.
+                next_token_ids = compact_ids.clone()
+                self.sampler._sync_token_ids_across_tp(next_token_ids, forward_batch.sampling_info)
+                self.ngram_embedding_manager.update_after_decode(
+                    next_token_ids=next_token_ids, forward_batch=forward_batch)
+                return next_token_ids
+            logits_output.next_token_logits = gather_full(raw_logits, tp.device_group)
+            logits_output.xpu_compact_token_ids = None
+
         observer = self.sampling_observer
         # Preserve two-argument overrides when observation is inactive.
         if observer is not None and observer.is_active(forward_batch.sampling_info):

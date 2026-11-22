@@ -292,6 +292,11 @@ class LogitsProcessorOutput:
     # Scheduler-local output copied alongside the ordinary generation result.
     auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
 
+    # Opt-in XPU TP2 decode: when present, next_token_logits is the raw
+    # BF16 local vocab shard. ModelRunner resolves this before preprocessing.
+    # Keep this extension last to preserve positional constructor arguments.
+    xpu_compact_token_ids: Optional[torch.Tensor] = None
+
     def finalize_input_logprobs(self) -> None:
         if self.input_logprobs_copy_done is None:
             return
@@ -490,6 +495,7 @@ class LogitsProcessor(nn.Module):
         # Set before graph capture by a speculative worker that finishes the TP
         # gather itself (see finish_deferred_gather / deferred_argmax).
         self.defer_verify_gather = False
+        self.xpu_compact_greedy = False
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -636,9 +642,20 @@ class LogitsProcessor(nn.Module):
                 logits[sample_indices] if sample_indices is not None else logits
             )
 
+            compact_token_ids = None
+            if (self.xpu_compact_greedy and logits_metadata.forward_mode.is_decode()
+                and sampled_logits.shape == (1, 101056)):
+                from sglang.srt.hardware_backend.xpu.kernels.muse_compact_greedy import distributed_argmax
+                tp = get_parallel().tp_group
+                compact_token_ids = distributed_argmax(
+                    sampled_logits, tp.rank_in_group, tp.device_group,
+                    sanitize=envs.SGLANG_SANITIZE_NAN_LOGITS.get(),
+                )
+
             # Decode mode or extend mode without return_logprob.
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
+                xpu_compact_token_ids=compact_token_ids,
                 hidden_states=hidden_states_to_store,
                 last_hidden_states=last_hidden_states_to_store,
                 mm_input_embeds=logits_metadata.mm_input_embeds,
@@ -1007,6 +1024,13 @@ class LogitsProcessor(nn.Module):
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
+
+        if (self.xpu_compact_greedy and logits_metadata.forward_mode.is_decode()
+            and logits.shape == (1, 101056) and logits.dtype == torch.bfloat16
+            and logits.device.type == "xpu" and self.do_tensor_parallel_all_gather
+            and not self.use_attn_tp_group and not self.do_tensor_parallel_all_gather_dp_attn
+            and not self.use_tp_lm_head_all_to_all and not self.return_full_logits):
+            return logits
 
         if self._can_gather_softcap_fused(
             logits, local_hidden_states, lm_head, logits_metadata

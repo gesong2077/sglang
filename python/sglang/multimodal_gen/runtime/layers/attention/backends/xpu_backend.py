@@ -34,7 +34,7 @@ class XPUAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
-        return [64, 96, 128, 192, 256]
+        return [64, 72, 96, 128, 192, 256]
 
     @staticmethod
     def get_enum() -> AttentionBackendEnum:

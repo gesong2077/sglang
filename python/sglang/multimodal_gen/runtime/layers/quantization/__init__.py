@@ -8,6 +8,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 
 QuantizationMethods = Literal[
     "auto-round",
+    "compressed-tensors",
     "fp8",
     "modelopt",
     "modelopt_fp8",
@@ -31,6 +32,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from sglang.multimodal_gen.runtime.layers.quantization.auto_round import (
         AutoRoundConfig,
     )
+    from sglang.multimodal_gen.runtime.layers.quantization.compressed_int8 import CompressedInt8Config
     from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
         BitsAndBytesConfig,
     )
@@ -56,6 +58,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
 
     method_to_config: dict[str, type[QuantizationConfig]] = {
         "auto-round": AutoRoundConfig,
+        "compressed-tensors": CompressedInt8Config,
         "modelopt": ModelOptFp8DiffusionConfig,
         "modelopt_fp8": ModelOptFp8Config,
         "modelopt_fp4": ModelOptFp4Config,

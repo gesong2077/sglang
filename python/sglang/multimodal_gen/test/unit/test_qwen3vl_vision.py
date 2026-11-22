@@ -27,6 +27,40 @@ from sglang.srt.models.qwen3_vl import (
 from sglang.srt.runtime_context import get_parallel
 
 
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="Intel XPU required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_xpu_flash_attention_for_packed_72_dim_vision_heads(dtype):
+    from sglang.multimodal_gen.runtime.layers.attention.backends.xpu_backend import (
+        XPUAttentionBackend,
+    )
+    from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+    from sglang.multimodal_gen.runtime.platforms.xpu import XpuPlatform
+
+    resolved = XpuPlatform.get_attn_backend_cls_str(AttentionBackendEnum.FA, 72, dtype)
+    assert resolved.endswith(".XPUAttentionBackend")
+    # The value tensor in the vision tower is a slice of a fused QKV projection.
+    qkv = torch.randn(98, 3, 8, 72, generator=torch.Generator().manual_seed(42))
+    q, k, v = qkv.to(dtype).unbind(1)
+    bounds = (0, 65, 98)
+    cu = torch.tensor(bounds, dtype=torch.int32, device="xpu")
+    impl = XPUAttentionBackend.get_impl_cls()(8, 72, False, 72**-0.5)
+    result = impl.forward_varlen(
+        q.to("xpu"),
+        k.to("xpu"),
+        qkv.to("xpu", dtype).select(1, 2),
+        cu_seqlens=cu,
+        max_seqlen=65,
+    )
+    expected = []
+    for start, end in zip(bounds, bounds[1:]):
+        qs, ks, vs = (x[start:end].transpose(0, 1).float() for x in (q, k, v))
+        probs = ((qs @ ks.transpose(1, 2)) * 72**-0.5).softmax(-1)
+        expected.append((probs @ vs).transpose(0, 1))
+    torch.testing.assert_close(
+        result.cpu().float(), torch.cat(expected), atol=0.006, rtol=0.01
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dim", [36, 40, 64])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

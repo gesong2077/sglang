@@ -13,10 +13,13 @@
 # ==============================================================================
 
 import logging
+import os
 from array import array
 from typing import Iterable, List, Optional, Tuple
 
 import torch
+
+_use_xpu_qk_norm_rope = os.environ.get("SGLANG_XPU_MUSE_QK_NORM_ROPE") == "1"
 from torch import nn
 from transformers.activations import ACT2FN
 from transformers.vision_utils import (
@@ -58,11 +61,78 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm, permute_inv
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_cpu, is_cuda
+from sglang.srt.runtime_context import get_forward, get_parallel
+from sglang.srt.utils import add_prefix, is_cpu, is_cuda, is_xpu
 
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
+_xpu_replica_layers = int(os.environ.get("SGLANG_XPU_MUSE_REPLICA_LAYERS", "0"))
+_xpu_streamed_layers = int(os.environ.get("SGLANG_XPU_MUSE_STREAMED_MLP_LAYERS", "0"))
+_fuse_replica_sum = (
+    os.environ.get("SGLANG_XPU_MUSE_REPLICA_SUM_NORM") == "1"
+    and os.environ.get("SGLANG_XPU_MUSE_FUSED_NORM") == "1"
+    and bool(int(os.environ.get("SGLANG_XPU_MUSE_MLP_EXCHANGE_SUM", "0")))
+)
+_host_memory_audit = os.environ.get("SGLANG_XPU_MUSE_HOST_MEMORY_AUDIT")
+_xpu_o_replica_layers = int(os.environ.get("SGLANG_XPU_MUSE_O_REPLICA_LAYERS", "0"))
+_use_xpu_packed_o = is_xpu() and os.environ.get("SGLANG_XPU_MUSE_PACKED_O_EXCHANGE") == "1"
+if _xpu_o_replica_layers:
+    if not is_xpu() or os.environ.get("SGLANG_XPU_MUSE_SEQUENCE_PARALLEL") != "1" or os.environ.get("SGLANG_XPU_MUSE_SEQUENCE_ALIGNMENT", "2") != "2":
+        raise ValueError("o_proj replicas require XPU sequence parallel with alignment 2")
+    from sglang.srt.hardware_backend.xpu.kernels.muse_o_replica import (
+        install_peer_o_shards, local_replicated_o_proj,
+    )
+_xpu_mlp_tile = int(os.environ.get("SGLANG_XPU_MUSE_MLP_TILE", "0"))
+if _xpu_mlp_tile < 0:
+    raise ValueError("Muse MLP tile must be non-negative")
+if _xpu_mlp_tile:
+    from sglang.srt.hardware_backend.xpu.kernels.muse_mlp_tile import tiled_mlp
+if _xpu_replica_layers < 0:
+    raise ValueError("Muse replica layer count must be non-negative")
+if _xpu_replica_layers:
+    if not is_xpu():
+        raise ValueError("Muse MLP replicas are only supported on XPU")
+    from sglang.srt.hardware_backend.xpu.kernels.muse_replica import (
+        install_peer_mlp_shards, local_replicated_mlp,
+    )
+
+_use_fused_xpu_norm = is_xpu() and os.environ.get("SGLANG_XPU_MUSE_FUSED_NORM") == "1"
+_xpu_input_norm_mode = int(os.environ.get("SGLANG_XPU_MUSE_INPUT_NORM_QUANT", "0"))
+_use_xpu_input_norm_quant = is_xpu() and _xpu_input_norm_mode in (1, 2)
+if _use_xpu_input_norm_quant:
+    from sglang.srt.hardware_backend.xpu.kernels.muse_input_norm import input_norm_quant
+if _use_fused_xpu_norm:
+    from sglang.srt.hardware_backend.xpu.kernels.muse_norm import fused_post_norm
+
+_use_fused_xpu_gate = is_xpu() and os.environ.get("SGLANG_XPU_MUSE_FUSED_GATE") == "1"
+if _use_fused_xpu_gate:
+    from sglang.srt.hardware_backend.xpu.kernels.muse_gate import fused_gate
+
+_use_fused_xpu_mlp = is_xpu() and os.environ.get("SGLANG_XPU_MUSE_FUSED_MLP") == "1"
+_use_fused_xpu_gate_quant = (
+    is_xpu() and os.environ.get("SGLANG_XPU_MUSE_FUSED_GATE_QUANT") == "1"
+)
+_use_xpu_sequence = (
+    is_xpu() and os.environ.get("SGLANG_XPU_MUSE_SEQUENCE_PARALLEL") == "1"
+)
+_use_xpu_merged_qkv = (
+    is_xpu() and os.environ.get("SGLANG_XPU_MUSE_MERGED_QKV") == "1"
+)
+_xpu_sequence_alignment = int(
+    os.environ.get("SGLANG_XPU_MUSE_SEQUENCE_ALIGNMENT", "2")
+)
+if _use_xpu_sequence:
+    from sglang.srt.hardware_backend.xpu.kernels.muse_sequence import (
+        sequence_parallel_post_attention,
+    )
+if _use_fused_xpu_mlp or _use_fused_xpu_gate_quant:
+    from sglang.srt.hardware_backend.xpu.quantization.w8a8_int8_kernels import (
+        W8A8Activation,
+        dynamic_w8a8_linear,
+    )
+    from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8 import (
+        CompressedTensorsW8A8Int8,
+    )
 
 if _is_cuda:
     from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
@@ -147,11 +217,36 @@ class MuseGlimmerMLP(nn.Module):
                 f"Muse Glimmer expects hidden_act=silu, got {config.hidden_act}"
             )
         self.act_fn = SiluAndMul()
+        scheme = getattr(self.gate_up_proj, "scheme", None)
+        self.fused_xpu_mlp = (
+            _use_fused_xpu_mlp
+            and isinstance(scheme, CompressedTensorsW8A8Int8)
+            and not scheme.is_static_input_scheme
+            and scheme.input_symmetric
+            and not self.gate_up_proj.gather_output
+            and self.gate_up_proj.bias is None
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+    def forward(self, x: torch.Tensor, *, skip_all_reduce=False) -> torch.Tensor:
+        if (
+            self.fused_xpu_mlp and skip_all_reduce and _xpu_mlp_tile
+            and isinstance(x, W8A8Activation) and x.shape[0] > _xpu_mlp_tile
+        ):
+            return tiled_mlp(
+                x, self.gate_up_proj.weight, self.gate_up_proj.weight_scale,
+                self.down_proj.weight, self.down_proj.weight_scale, _xpu_mlp_tile,
+            )
+        if self.fused_xpu_mlp and x.dtype == torch.bfloat16:
+            x = dynamic_w8a8_linear(
+                x,
+                self.gate_up_proj.weight,
+                self.gate_up_proj.weight_scale,
+                silu_mul=True,
+            )
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x, skip_all_reduce=skip_all_reduce)
         return x
 
 
@@ -190,8 +285,27 @@ class MuseGlimmerAttention(nn.Module):
         self.use_qk_norm = config.use_qk_norm
         self.use_output_gate = config.use_attn_output_gate
 
-        # Split q/k/v; one module holds one quant format.
+        # Mixed quantization normally needs separate modules. When all three
+        # projections are explicitly excluded, they can share one BF16 GEMM.
+        merge_unquantized_qkv = False
+        if _use_xpu_merged_qkv and quant_config is not None:
+            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                CompressedTensorsConfig,
+            )
+            from sglang.srt.layers.quantization.compressed_tensors.utils import (
+                should_ignore_layer,
+            )
+
+            merge_unquantized_qkv = isinstance(
+                quant_config, CompressedTensorsConfig
+            ) and all(
+                should_ignore_layer(add_prefix(name, prefix), quant_config.ignore)
+                for name in ("q_proj", "k_proj", "v_proj")
+            )
         self.unfused_qkv = quant_config is not None
+        self.decode_merged_qkv = merge_unquantized_qkv
+        if merge_unquantized_qkv:
+            self.unfused_qkv = False
         if self.unfused_qkv:
             if self.total_num_kv_heads < tp_size:
                 raise ValueError(
@@ -228,7 +342,7 @@ class MuseGlimmerAttention(nn.Module):
                 self.total_num_heads,
                 self.total_num_kv_heads,
                 bias=False,
-                quant_config=quant_config,
+                quant_config=None if merge_unquantized_qkv else quant_config,
                 prefix=add_prefix("qkv_proj", prefix),
             )
         self.o_proj = RowParallelLinear(
@@ -246,6 +360,20 @@ class MuseGlimmerAttention(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("output_gate_proj", prefix),
             )
+
+        self.fused_xpu_gate_quant = (
+            _use_fused_xpu_gate_quant
+            and self.use_output_gate
+            and self.o_proj.input_is_parallel
+            and not self.output_gate_proj.gather_output
+            and all(
+                isinstance(getattr(layer, "scheme", None), CompressedTensorsW8A8Int8)
+                and not layer.scheme.is_static_input_scheme
+                and layer.scheme.input_symmetric
+                and layer.bias is None
+                for layer in (self.output_gate_proj, self.o_proj)
+            )
+        )
 
         self.qk_norm = (
             RMSNorm(
@@ -288,37 +416,96 @@ class MuseGlimmerAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        *,
+        skip_all_reduce=False,
+        gate_activation=None,
     ) -> torch.Tensor:
         if self.unfused_qkv:
             q, _ = self.q_proj(hidden_states)
             k, _ = self.k_proj(hidden_states)
             v, _ = self.v_proj(hidden_states)
+        elif self.decode_merged_qkv and not forward_batch.forward_mode.is_decode():
+            # Keep prefill's original three GEMMs and rounding. Decode uses
+            # one GEMV; views share the loaded BF16 checkpoint storage.
+            qw, kw, vw = self.qkv_proj.weight.split(
+                [self.q_size, self.kv_size, self.kv_size], dim=0
+            )
+            q = torch.nn.functional.linear(hidden_states, qw)
+            k = torch.nn.functional.linear(hidden_states, kw)
+            v = torch.nn.functional.linear(hidden_states, vw)
         else:
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        if self.qk_norm is not None:
-            q, k = apply_qk_norm(
-                q,
-                k,
-                q_norm=self.qk_norm,
-                k_norm=self.qk_norm,
-                head_dim=self.head_dim,
+        fused_qk = (
+            _use_xpu_qk_norm_rope
+            and forward_batch.forward_mode.is_decode()
+            and self.qk_norm is not None
+            and q.device.type == "xpu"
+            and q.shape == (1, 2048)
+            and k.shape == (1, 128)
+            and q.is_contiguous()
+            and k.is_contiguous()
+            and q.dtype == k.dtype == torch.bfloat16
+            and (
+                self.rotary_emb is None
+                or self.rotary_emb.rotary_dim == 128
             )
-
-        if self.rotary_emb is not None:
-            q, k = self.rotary_emb(positions, q, k)
+        )
+        if fused_qk:
+            from sglang.srt.hardware_backend.xpu.kernels.muse_qk_norm_rope import forward
+            q, k = forward(
+                q, k, self.qk_norm.weight, self.qk_norm.variance_epsilon,
+                positions if self.rotary_emb is not None else None,
+                self.rotary_emb.cos_sin_cache if self.rotary_emb is not None else None,
+                is_neox=self.rotary_emb.is_neox_style if self.rotary_emb is not None else False,
+            )
+        else:
+            if self.qk_norm is not None:
+                q, k = apply_qk_norm(
+                    q,
+                    k,
+                    q_norm=self.qk_norm,
+                    k_norm=self.qk_norm,
+                    head_dim=self.head_dim,
+                )
+            if self.rotary_emb is not None:
+                q, k = self.rotary_emb(positions, q, k)
 
         attn_out = self.attn(q, k, v, forward_batch)
 
         if self.use_output_gate:
+            if (
+                self.fused_xpu_gate_quant
+                and hidden_states.dtype == attn_out.dtype == torch.bfloat16
+                and attn_out.is_contiguous()
+                and not get_forward().sp_active
+            ):
+                gated = dynamic_w8a8_linear(
+                    gate_activation if gate_activation is not None else hidden_states,
+                    self.output_gate_proj.weight,
+                    self.output_gate_proj.weight_scale,
+                    output_gate=attn_out,
+                    pack_output_gate=(
+                        _use_xpu_packed_o and skip_all_reduce
+                        and getattr(self, "_xpu_has_o_replica", False)
+                    ),
+                )
+                if skip_all_reduce and getattr(self, "_xpu_has_o_replica", False):
+                    tp = get_parallel().tp_group
+                    return local_replicated_o_proj(self, gated, tp.device_group, tp.rank_in_group)
+                # The original RowParallelLinear still owns TP communication.
+                out, _ = self.o_proj(gated, skip_all_reduce=skip_all_reduce)
+                return out
             gate, _ = self.output_gate_proj(hidden_states)
             if _is_cuda or _is_cpu:
                 attn_out = fused_sigmoid_mul(attn_out, gate, inplace=True)
+            elif _use_fused_xpu_gate:
+                attn_out = fused_gate(attn_out, gate)
             else:
                 attn_out = torch.sigmoid(gate) * attn_out
 
-        out, _ = self.o_proj(attn_out)
+        out, _ = self.o_proj(attn_out, skip_all_reduce=skip_all_reduce)
         return out
 
 
@@ -354,8 +541,61 @@ class MuseGlimmerDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(positions, hidden_states, forward_batch)
+        gate_activation = None
+        if (
+            _use_xpu_input_norm_quant and self.self_attn.fused_xpu_gate_quant
+            and (_xpu_input_norm_mode == 1 or forward_batch.forward_mode.is_decode())
+        ):
+            hidden_states, gate_activation = input_norm_quant(hidden_states, self.input_layernorm)
+        else:
+            hidden_states = self.input_layernorm(hidden_states)
+        if (
+            _use_xpu_sequence
+            and self.mlp.fused_xpu_mlp
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.shape[0] >= 512
+            and forward_batch.forward_mode.is_extend()
+            and get_parallel().tp_size == 2
+            and get_parallel().attn_tp_size == 2
+            and not get_forward().sp_active
+        ):
+            hidden_states = self.self_attn(
+                positions, hidden_states, forward_batch, skip_all_reduce=True,
+                gate_activation=gate_activation,
+            )
+            tp = get_parallel().tp_group
+            local_mlp = None
+            if getattr(self.mlp, "_xpu_has_replica", False):
+                local_mlp = lambda x: local_replicated_mlp(
+                    self.mlp, x, return_partials=_fuse_replica_sum and x.shape[-1] == 6656
+                )
+            elif hasattr(self.mlp, "_xpu_streamed_replica"):
+                stream_state, stream_index = self.mlp._xpu_streamed_replica
+                if stream_state.active:
+                    local_mlp = lambda x: stream_state.run(stream_index, self.mlp, x)
+            return sequence_parallel_post_attention(
+                hidden_states,
+                residual,
+                self.post_attn_norm,
+                self.post_attention_layernorm,
+                self.mlp,
+                self.post_ffn_norm,
+                tp.device_group,
+                tp.rank_in_group,
+                alignment=_xpu_sequence_alignment,
+                original_rows=positions.numel() if getattr(self.self_attn, "_xpu_has_o_replica", False) else None,
+                local_mlp=local_mlp,
+            )
+        hidden_states = self.self_attn(positions, hidden_states, forward_batch,
+                                       gate_activation=gate_activation)
+        if (_use_fused_xpu_norm and hidden_states.dtype == torch.bfloat16
+                and hidden_states.shape[-1] == 6656):
+            residual, hidden_states = fused_post_norm(
+                hidden_states, residual, self.post_attn_norm,
+                self.post_attention_layernorm, quantize=self.mlp.fused_xpu_mlp,
+            )
+            hidden_states = self.mlp(hidden_states)
+            return fused_post_norm(hidden_states, residual, self.post_ffn_norm)[0]
         hidden_states = residual + self.post_attn_norm(hidden_states)
 
         residual = hidden_states
@@ -417,6 +657,17 @@ class MuseGlimmerModel(nn.Module):
         if self.embed_norm is not None:
             hidden_states = self.embed_norm(hidden_states)
 
+        stream_state = getattr(self, "_xpu_streamed_mlp", None)
+        if stream_state is not None:
+            stream_state.active = False
+            if (
+                _use_xpu_sequence and hidden_states.dtype == torch.bfloat16
+                and hidden_states.shape[0] >= 8192
+                and forward_batch.forward_mode.is_extend()
+                and not get_forward().sp_active
+            ):
+                stream_state.begin()
+
         aux_hidden_states = []
         for i, layer in enumerate(self.layers):
             if i in self.layers_to_capture:
@@ -424,6 +675,12 @@ class MuseGlimmerModel(nn.Module):
             hidden_states = layer(positions, hidden_states, forward_batch)
 
         hidden_states = self.norm(hidden_states)
+        if (
+            _host_memory_audit and hidden_states.shape[0] == 1
+            and forward_batch.forward_mode.is_extend()
+        ):
+            from sglang.srt.hardware_backend.xpu.kernels.muse_host_memory_audit import snapshot
+            snapshot(self, _host_memory_audit)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -837,6 +1094,12 @@ class MuseGlimmerForCausalLM(nn.Module):
         self.logits_processor = LogitsProcessor(
             config, logit_scale=config.output_multiplier
         )
+        self.logits_processor.xpu_compact_greedy = (
+            os.environ.get("SGLANG_XPU_MUSE_COMPACT_GREEDY") == "1"
+            and is_xpu() and get_parallel().tp_size == 2
+            and config.vocab_size == 202048
+            and self.logits_processor.final_logit_softcapping == 20.0
+        )
         self.capture_aux_hidden_states = False
 
     def get_attention_sliding_window_size(self):
@@ -877,6 +1140,15 @@ class MuseGlimmerForCausalLM(nn.Module):
             )
         self.capture_aux_hidden_states = True
         self.model.layers_to_capture = list(layer_ids)
+
+    def post_load_weights(self):
+        if _xpu_replica_layers:
+            install_peer_mlp_shards(self, _xpu_replica_layers)
+        if _xpu_o_replica_layers:
+            install_peer_o_shards(self, _xpu_o_replica_layers)
+        if _xpu_streamed_layers:
+            from sglang.srt.hardware_backend.xpu.kernels.muse_streamed_replica import install_streamed_peer_mlp
+            install_streamed_peer_mlp(self, _xpu_replica_layers, _xpu_streamed_layers)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -939,6 +1211,7 @@ class MuseGlimmerForCausalLM(nn.Module):
                 loaded += 1
 
         logger.info("Muse Glimmer: loaded %d weight tensors", loaded)
+        self.post_load_weights()
 
 
 class MuseGlimmerForConditionalGeneration(MuseGlimmerForCausalLM):

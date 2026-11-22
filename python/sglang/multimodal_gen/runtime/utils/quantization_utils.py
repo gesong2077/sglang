@@ -52,7 +52,7 @@ from sglang.srt.model_loader.checkpoint_quantization import (
     resolve_checkpoint_quant_spec,
 )
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_npu, is_xpu
 
 logger = init_logger(__name__)
 
@@ -543,6 +543,16 @@ def _load_quant_cls(quant_cfg: dict):
     quant_method = _resolve_quant_method_name(quant_cfg)
     if not quant_method:
         raise ValueError("Missing quant_method in quantization config.")
+    if (
+        quant_method == "compressed-tensors"
+        and quant_cfg.get("format") == "pack-quantized"
+        and is_xpu()
+    ):
+        from sglang.multimodal_gen.runtime.layers.quantization.compressed_w4a16 import (
+            PackedInt4Config,
+        )
+
+        return PackedInt4Config
     return get_quantization_config(quant_method)
 
 
