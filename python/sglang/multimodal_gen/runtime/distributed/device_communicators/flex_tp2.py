@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 from sglang.multimodal_gen import envs
 
@@ -20,7 +21,10 @@ def _add_truncated(X, Y, N: tl.constexpr, BLOCK: tl.constexpr):
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     a = tl.load(X + i, i < N, 0).to(tl.float32)
     b = tl.load(Y + i, i < N, 0).to(tl.float32)
-    high = ((a + b).to(tl.uint32, bitcast=True) >> 16).to(tl.uint16)
+    # oneCCL first adds in round-to-nearest FP32, then discards its low
+    # 16 bits. A contracted add-to-BF16.rtz differs for small opposite signs.
+    total = libdevice.add_rn(a, b)
+    high = (total.to(tl.uint32, bitcast=True) >> 16).to(tl.uint16)
     tl.store(X + i, high.to(tl.bfloat16, bitcast=True), i < N)
 
 
