@@ -295,6 +295,7 @@ class _Block(nn.Module):
         )
         self.proj["ffn_up_gate"] = nn.Linear(dim, 2 * ffn_dim, bias=False)
         self.proj["ffn_down"] = nn.Linear(ffn_dim, dim, bias=False)
+        self.share_convrot_qkv = False
 
     def forward(self, x, rope, modulation, attn_mask_meta=None):
         shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = modulation.unbind(1)
@@ -303,6 +304,12 @@ class _Block(nn.Module):
         if dtype == torch.int8:
             dtype = self.proj["q"].params_dtype
         y = y.to(dtype)
+        if self.share_convrot_qkv:
+            from sglang.multimodal_gen.runtime.layers.quantization.moss_w8a8 import (
+                prepare_moss_qkv_input,
+            )
+
+            y = prepare_moss_qkv_input(self.proj, y)
         q = _norm_rope(self.q_norm, self.proj["q"](y), rope, self.heads)
         k = _norm_rope(self.k_norm, self.proj["k"](y), rope, self.heads)
         x = residual_gate_add(
@@ -439,10 +446,14 @@ class MOSSImageTransformer(BaseDiT, LayerwiseOffloadableModuleMixin):
         self.video_head_modulation = nn.Linear(dim, 2 * dim)
         if quant_config is not None:
             from sglang.multimodal_gen.runtime.layers.quantization.moss_w8a8 import (
+                SerializedConvRotConfig,
                 install_moss_projections,
             )
 
             install_moss_projections(self, quant_config)
+            if isinstance(quant_config, SerializedConvRotConfig):
+                for block in self.layers:
+                    block.share_convrot_qkv = True
 
     def _unpad_text(self, encoder_hidden_states, encoder_attention_mask):
         if (

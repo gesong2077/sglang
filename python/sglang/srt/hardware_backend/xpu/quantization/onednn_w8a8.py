@@ -1,18 +1,23 @@
 """Opt-in oneDNN INT8 GEMM with per-token and per-channel scale epilogues.
 
-The companion host bridge must be built against oneDNN SYCL. Its path is supplied
-explicitly; importing this module never builds code or replaces PyTorch libraries.
+The companion host bridge is built against oneDNN SYCL. It can be installed
+alongside this module or selected with SGLANG_XPU_W8A8_ONEDNN_LIB.
 """
 
 import ctypes as C
 import os
 from functools import lru_cache
+from pathlib import Path
 
 import torch
 
 _sequence_padding = os.environ.get("SGLANG_XPU_MUSE_SEQUENCE_PARALLEL") == "1"
 _sequence_alignment = int(os.environ.get("SGLANG_XPU_MUSE_SEQUENCE_ALIGNMENT", "2"))
-_lib = C.CDLL(os.environ["SGLANG_XPU_W8A8_ONEDNN_LIB"])
+_lib = C.CDLL(
+    os.environ.get(
+        "SGLANG_XPU_W8A8_ONEDNN_LIB", str(Path(__file__).with_name("libonednn_w8a8.so"))
+    )
+)
 _lib.ow_error.restype = C.c_char_p
 _lib.ow_create.argtypes = [C.c_void_p] + [C.c_int] * 5
 _lib.ow_create.restype = C.c_void_p
@@ -27,6 +32,7 @@ class _Plan:
     def __init__(self, device, m, k, n, transposed):
         queue = torch.xpu.current_stream(device).sycl_queue
         # Binary post-ops preserve (float(accum) * row_scale) * column_scale.
+        self._destroy = _lib.ow_destroy
         self.ptr = _lib.ow_create(queue, m, k, n, transposed, 2)
         if not self.ptr:
             raise RuntimeError(_lib.ow_error().decode())
@@ -34,7 +40,7 @@ class _Plan:
 
     def __del__(self):
         if getattr(self, "ptr", None):
-            _lib.ow_destroy(self.ptr)
+            self._destroy(self.ptr)
 
 
 @lru_cache(maxsize=128)
@@ -42,7 +48,15 @@ def _plan(device, m, k, n, transposed):
     return _Plan(device, m, k, n, transposed)
 
 
-def scaled_int8_mm(q, weight, row_scale, column_scale):
+@lru_cache(maxsize=128)
+def _optional_plan(device, m, k, n, transposed):
+    try:
+        return _plan(device, m, k, n, transposed)
+    except RuntimeError:
+        return None
+
+
+def scaled_int8_mm(q, weight, row_scale, column_scale, *, optional=False):
     m, k = q.shape
     n = weight.shape[1]
     if (
@@ -60,7 +74,10 @@ def scaled_int8_mm(q, weight, row_scale, column_scale):
         or any(t.device != q.device for t in (weight, row_scale, column_scale))
     ):
         raise ValueError("Unsupported oneDNN W8A8 tensor layout or dtype")
-    plan = _plan(q.device.index, m, k, n, int(weight.stride(0) == 1))
+    get_plan = _optional_plan if optional else _plan
+    plan = get_plan(q.device.index, m, k, n, int(weight.stride(0) == 1))
+    if plan is None:
+        return None
     # Muse's TP2 reduce-scatter needs an even number of rows. Keep the logical
     # GEMM shape unchanged but reserve a tail so the communication path can
     # initialize just its padding, avoiding a full activation copy.

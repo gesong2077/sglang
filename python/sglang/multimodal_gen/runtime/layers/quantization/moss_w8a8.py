@@ -47,6 +47,52 @@ class ConvRotMethod(DynamicInt8Method):
         return result.view(*x.shape[:-1], layer.weight.shape[0]).to(x.dtype)
 
 
+class _DiTConvRotMethod(ConvRotMethod):
+    def prepare_input(self, x):
+        from sglang.srt.hardware_backend.xpu.quantization.moss_convrot import (
+            quantize_rotated,
+        )
+
+        return quantize_rotated(rotate(x.float(), self.group), x.dtype)
+
+    def apply(self, layer, x, bias=None):
+        if isinstance(x, torch.Tensor):
+            if not _can_pack_dit_input(x) or bias is not None:
+                return super().apply(layer, x, bias)
+            x = self.prepare_input(x)
+        from sglang.srt.hardware_backend.xpu.quantization.moss_convrot import (
+            project_packed,
+        )
+
+        return project_packed(x, layer.weight, layer.weight_scale)
+
+
+def _can_pack_dit_input(x):
+    return (
+        x.device.type == "xpu"
+        and x.dtype == torch.bfloat16
+        and x.numel() > 0
+        and x.shape[-1] <= 8192
+    )
+
+
+def prepare_moss_qkv_input(proj, x):
+    """Share only this forward's activation across three plain ConvRot projections."""
+    if _can_pack_dit_input(x):
+        layers = (proj["q"], proj["k"], proj["v"])
+        if all(
+            type(layer) is _PackedLinear
+            and isinstance(layer.quant_method, _DiTConvRotMethod)
+            and layer.quant_method.group == layers[0].quant_method.group
+            and layer.bias is None
+            and not layer._forward_pre_hooks
+            and not layer._forward_hooks
+            for layer in layers
+        ):
+            return layers[0].quant_method.prepare_input(x)
+    return x
+
+
 class SerializedConvRotConfig(CompressedInt8Config):
     def __init__(self, groups):
         if not groups or any(v not in (16, 64, 256) for v in groups.values()):
@@ -65,6 +111,8 @@ class SerializedConvRotConfig(CompressedInt8Config):
         return cls(config["layer_groups"])
 
     def get_quant_method(self, layer, prefix):
+        if prefix.startswith("layers."):
+            return _DiTConvRotMethod(self.groups[prefix])
         return ConvRotMethod(self.groups[prefix])
 
 
