@@ -101,6 +101,48 @@ def test_registered_tp2_waits_for_delayed_producers(peer, flex_tp2_group):
             assert torch.equal(out, reference)
 
 
+def test_peer_sum_preserves_bf16_bits(flex_tp2_group):
+    """Compare the 32 MiB peer vector kernel against the original scalar kernel."""
+    from sglang.multimodal_gen.runtime.managers.forward_context import (
+        set_forward_context,
+    )
+
+    group, device = flex_tp2_group
+    if group.flex_tp2 is None or group.flex_tp2.registered is None:
+        pytest.skip("requires the registered DMA bridge on both ranks")
+    count = 16 * 1024 * 1024
+    with set_forward_context(0, None, is_denoising=True):
+        group.all_reduce(torch.ones(count, dtype=torch.bfloat16, device=device))
+    registered = group.flex_tp2.registered
+    if not registered.peer_ready:
+        pytest.skip("peer DMA-BUF could not be established")
+
+    # Cross every BF16 representation with zeros, subnormals, infinities,
+    # different NaN payloads, and normal inputs around BF16 rounding ties.
+    patterns = torch.arange(65536, dtype=torch.int32).to(torch.int16)
+    partners = [0, 1, 0x7F, 0x80, 0x3F80, 0x3B80, 0x7F7F, 0x7F80, 0x7F81, 0x7FFF]
+    partners += [word | 0x8000 for word in partners]
+    partners += list(range(118)) + [word | 0x8000 for word in range(118)]
+    if group.rank_in_group == 0:
+        words = patterns.repeat(len(partners))
+    else:
+        words = (
+            torch.tensor(partners, dtype=torch.int32)
+            .to(torch.int16)
+            .repeat_interleave(65536)
+        )
+    values = words.to(device).view(torch.bfloat16)
+    for offset in (0, 1):
+        storage = torch.empty(count + offset, dtype=torch.bfloat16, device=device)
+        for truncate in (False, True):
+            expected = values.clone()
+            actual = storage[offset:]
+            actual.copy_(values)
+            registered.all_reduce(expected, truncate, peer=False)
+            registered.all_reduce(actual, truncate, peer=True)
+            assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
 def _peer_setup_worker(rank, rendezvous):
     """Exercise the real Unix descriptor exchange and asymmetric failures on CPU."""
     import ctypes

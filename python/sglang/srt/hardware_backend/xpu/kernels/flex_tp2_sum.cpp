@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <immintrin.h>
 #include <level_zero/ze_api.h>
+#include <sycl/ext/intel/esimd.hpp>
 #include <sycl/ext/intel/math/imf_rounding_math.hpp>
 #include <sycl/ext/oneapi/backend/level_zero.hpp>
 #include <sycl/sycl.hpp>
@@ -76,6 +77,36 @@ struct PeerInbox {
         if (local) zeMemFree(ctx,local);
     }
 };
+
+// Both operands reside in local VRAM after the posted peer write. Block
+// loads/stores let one SIMD invocation reduce a whole aligned cache line pair.
+sycl::event add_peer_blocks(sycl::queue& q, uint16_t* x, const uint16_t* other,
+                           size_t count, bool truncate) {
+    namespace es = sycl::ext::intel::esimd;
+    constexpr int width = 64;
+    return q.parallel_for(sycl::range<1>(count / width), [=](sycl::id<1> id) SYCL_ESIMD_KERNEL {
+        const size_t offset = id[0] * width;
+        const auto a = es::block_load<uint16_t, width>(x + offset);
+        const auto b = es::block_load<uint16_t, width>(other + offset);
+        es::simd<uint32_t, width> a_bits = es::convert<uint32_t>(a) << 16;
+        es::simd<uint32_t, width> b_bits = es::convert<uint32_t>(b) << 16;
+        es::simd<float, width> sum = a_bits.bit_cast_view<float>() + b_bits.bit_cast_view<float>();
+        es::simd<uint32_t, width> result = sum.bit_cast_view<uint32_t>();
+        const auto magnitude = result & 0x7fffffffU;
+        // Match the existing fadd_rn implementation for NaNs and signed zero
+        // when cancelling opposite BF16 subnormals (or adding signed zeros).
+        const auto nan = magnitude > 0x7f800000U;
+        const auto zero = (magnitude == 0) & ((a & 0x7fffU) < 0x80);
+        if ((nan | zero).any()) {
+            result.merge(0x7fc00000U, nan);
+            es::simd<uint32_t, width> sign = a_bits & 0x80000000U;
+            sign.merge(b_bits & 0x80000000U, (a & 0x7fffU) == 0);
+            result.merge(sign, zero);
+        }
+        if (!truncate) result += 0x7fffU + ((result >> 16) & 1U);
+        es::block_store(x + offset, es::convert<uint16_t>(result >> 16));
+    });
+}
 
 // The first four slots hold two generations of two rank-local messages. The
 // final page is control memory, with one host-written counter per cache line.
@@ -157,6 +188,12 @@ struct Context {
             other = inbox->local + parity * capacity;
         } else {
             q.memcpy(other, bank + (1-rank)*capacity, count * 2);
+        }
+        if (direct && count == 16 * 1024 * 1024 &&
+            (reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(other)) % 128 == 0) {
+            consumer = add_peer_blocks(q, x, other, count, truncate);
+            last_queue = q;
+            return;
         }
         consumer = q.parallel_for(sycl::range<1>(count), [=](sycl::id<1> id) {
             size_t i = id[0];
