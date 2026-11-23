@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
     UnquantizedLinearMethod,
+    apply_unquantized_linear,
 )
 from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
 from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitchen import (
@@ -384,6 +385,44 @@ def _stacked_rows(a, b):
     return a.as_strided((2 * a.shape[0], a.shape[1]), (a.shape[1], 1))
 
 
+class _FlexTP2ColumnMethod(UnquantizedLinearMethod):
+    """Keep one copy of each weight in the measured 4096-token GEMM layout."""
+
+    @classmethod
+    @torch.no_grad()
+    def prepare(cls, layers):
+        for layer in layers:
+            if type(layer) is not ColumnParallelLinear or layer.tp_size != 2:
+                continue
+            if type(layer.quant_method) not in (UnquantizedLinearMethod, cls):
+                continue
+            w = layer.weight
+            if (
+                w.device.type == "xpu"
+                and w.dtype == torch.bfloat16
+                and w.shape in ((2048, 4096), (6144, 4096))
+                and w.is_contiguous()
+                and torch.xpu.get_device_properties(w.device).device_id == 0x56C0
+            ):
+                w.data = w.T.contiguous().T
+                layer.quant_method = cls()
+
+    def apply(self, layer, x, bias=None):
+        w = layer.weight
+        # oneDNN can choose a different accumulation order on short prefixes.
+        # Restore the original physical layout for every unmeasured geometry.
+        if not (
+            x.device.type == "xpu"
+            and x.dtype == torch.bfloat16
+            and x.shape == (1, 4096, 4096)
+            and x.is_contiguous()
+            and not torch.compiler.is_compiling()
+            and torch.xpu.get_device_properties(x.device).device_id == 0x56C0
+        ):
+            w = w.contiguous()
+        return apply_unquantized_linear(x, w, bias)
+
+
 class QwenImage21FeedForward(nn.Module):
     def __init__(self, dim, ratio, quant_config, prefix):
         super().__init__()
@@ -438,6 +477,8 @@ class QwenImage21FeedForward(nn.Module):
         comfy_kitchen INT8 projections are left alone.
         """
         gate, up = self.gate_layer, self.proj
+        if _is_xpu:
+            _FlexTP2ColumnMethod.prepare((gate, up))
         if self.packed_gate_up() is not None:
             return
         if not (
@@ -598,6 +639,8 @@ class QwenImage21Attention(nn.Module):
         projections are left alone and the packed path stays off.
         """
         layers = (self.to_q, self.to_k, self.to_v)
+        if _is_xpu:
+            _FlexTP2ColumnMethod.prepare(layers)
         if self.packed_qkv_weight() is not None:
             return
         if not all(
