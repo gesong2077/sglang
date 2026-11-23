@@ -33,6 +33,13 @@ def test_bf16_silu_mul_all_inputs(device, row_padding):
     assert actual.stride(-2) == x.size(-1) + row_padding
     torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
 
+    # The grouped TP2 GEMM stores gate and up side-by-side in each row.
+    gate, up = torch.cat((x, value), dim=-1).chunk(2, dim=-1)
+    interleaved = b60.fused_pointwise(
+        gate, up, input_row_padding=gate.shape[-1], output_row_padding=row_padding
+    )
+    torch.testing.assert_close(interleaved, expected, rtol=0, atol=0, equal_nan=True)
+
 
 @pytest.mark.parametrize(
     "device,tokens,heads",
@@ -82,3 +89,48 @@ def test_flex_swiglu_convrot_pack(device):
     )
     assert torch.equal(actual.values, expected.values)
     assert torch.equal(actual.scales, expected.scales)
+
+
+@pytest.mark.parametrize("device", flex_devices())
+@torch.no_grad()
+def test_flex_group_uses_live_weights_and_preserves_child_forward(device):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
+    from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import (
+        _FlexTP2ColumnMethod,
+    )
+
+    group = SimpleNamespace(world_size=2, rank_in_group=0)
+    with torch.device(device):
+        layers = [
+            ColumnParallelLinear(
+                4096, 12288, bias=False, params_dtype=torch.bfloat16, tp_group=group
+            ).eval()
+            for _ in range(2)
+        ]
+        x = torch.empty((1, 4096, 4096), dtype=torch.bfloat16)
+    _FlexTP2ColumnMethod.prepare(layers)
+    shared = _FlexTP2ColumnMethod.for_image(x, layers)
+    assert shared is not None
+    layers[1].weight[0, 0].fill_(9)
+    assert shared[0, 6144].item() == 9
+    assert _FlexTP2ColumnMethod.for_image(x[:, :32], layers) is None
+
+    with layers[0].register_forward_pre_hook(lambda *args: None):
+        assert _FlexTP2ColumnMethod.for_image(x, layers) is None
+    with torch.nn.modules.module.register_module_forward_hook(lambda *args: None):
+        assert _FlexTP2ColumnMethod.for_image(x, layers) is None
+    layers[0].train()
+    assert _FlexTP2ColumnMethod.for_image(x, layers) is None
+    layers[0].eval()
+    with torch.enable_grad():
+        assert _FlexTP2ColumnMethod.for_image(x, layers) is None
+    with patch.object(torch.compiler, "is_compiling", return_value=True):
+        assert _FlexTP2ColumnMethod.for_image(x, layers) is None
+
+    # Replacing a parameter can break sharing after loading an adapter.
+    # Re-read the current storage rather than serving stale packed weights.
+    layers[1].weight = torch.nn.Parameter(layers[1].weight.detach().clone())
+    assert _FlexTP2ColumnMethod.for_image(x, layers) is None

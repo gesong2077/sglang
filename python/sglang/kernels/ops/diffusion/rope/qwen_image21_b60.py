@@ -14,7 +14,7 @@ def _is_b60(device):
 
 
 @lru_cache
-def _is_flex(device):
+def is_flex_device(device):
     return torch.xpu.get_device_properties(device).device_id == 0x56C0
 
 
@@ -35,7 +35,7 @@ def can_fuse_qk(x, weight, rope):
         and not torch.is_grad_enabled()
         and not torch.compiler.is_compiling()
         and (
-            _is_b60(x.device) or (_is_flex(x.device) and x.shape == (1, 4096, 16, 128))
+            _is_b60(x.device) or (is_flex_device(x.device) and x.shape == (1, 4096, 16, 128))
         )
         and x.ndim == 4
         and x.shape[0] == 1
@@ -134,7 +134,7 @@ def _flex_qk_kernel(
 def qk_norm_rope(x, weight, rope, eps):
     out = torch.empty_like(x)
     rows = x.numel() // 128
-    flex = _is_flex(x.device)
+    flex = is_flex_device(x.device)
     block = 32 if flex else 16
     with torch.xpu.device(x.device):
         kernel = _flex_qk_kernel if flex else _qk_kernel
@@ -155,7 +155,7 @@ def qk_norm_rope(x, weight, rope, eps):
 
 @lru_cache
 def _supports_pointwise(device):
-    return _is_b60(device) or _is_flex(device)
+    return _is_b60(device) or is_flex_device(device)
 
 
 def can_fuse_pair(x, other):
@@ -186,10 +186,12 @@ def _pointwise_kernel(
     RESIDUAL: tl.constexpr,
     ROW_PAD: tl.constexpr,
     BLOCK: tl.constexpr,
+    INPUT_ROW_PAD: tl.constexpr,
 ):
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    x = tl.load(X + i, i < N, 0)
-    update = tl.load(U + i, i < N, 0).to(tl.float32)
+    j = i + (i // WIDTH) * INPUT_ROW_PAD
+    x = tl.load(X + j, i < N, 0)
+    update = tl.load(U + j, i < N, 0).to(tl.float32)
     if RESIDUAL:
         gate = tl.load(G + i % WIDTH).to(tl.float32)
         out = x.to(tl.float32) + (update * gate).to(tl.bfloat16).to(tl.float32)
@@ -207,7 +209,7 @@ def silu_table(device):
     return torch.nn.functional.silu(values.to(torch.int16).view(torch.bfloat16))
 
 
-def fused_pointwise(x, update, gate=None, *, output_row_padding=0):
+def fused_pointwise(x, update, gate=None, *, output_row_padding=0, input_row_padding=0):
     width = x.shape[-1]
     if output_row_padding:
         out = x.new_empty((*x.shape[:-1], width + output_row_padding))[..., :width]
@@ -224,6 +226,7 @@ def fused_pointwise(x, update, gate=None, *, output_row_padding=0):
             gate is not None,
             output_row_padding,
             1024,
+            input_row_padding,
             num_warps=4,
             enable_fp_fusion=False,
         )

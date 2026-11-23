@@ -80,6 +80,10 @@ if _is_xpu:
 _FLEX_SWIGLU_PACK = BitExactFusionGate(
     "Flex 170 BF16 SwiGLU + ConvRot INT8 pack", per_signature=True
 )
+_FLEX_GATE_UP = BitExactFusionGate(
+    "Flex 170 BF16 gate/up and SwiGLU", per_signature=True
+)
+_FLEX_QKV = BitExactFusionGate("Flex 170 BF16 batch Q/K/V", per_signature=True)
 _XPU_QK = BitExactFusionGate("XPU Q/K RMSNorm + RoPE", per_signature=True)
 _B60_RESIDUAL = BitExactFusionGate("B60 BF16 gated residual")
 _B60_SILU = BitExactFusionGate("B60 BF16 SiLU-mul")
@@ -407,6 +411,95 @@ class _FlexTP2ColumnMethod(UnquantizedLinearMethod):
                 w.data = w.T.contiguous().T
                 layer.quant_method = cls()
 
+        # Own exactly one copy of each shard. Q/K/V remain contiguous [K,N]
+        # matrices, while gate/up become adjacent slices of a single [K,2N].
+        if torch.compiler.is_compiling() or not all(
+            type(layer) is ColumnParallelLinear and type(layer.quant_method) is cls
+            for layer in layers
+        ):
+            return
+        shards = [layer.weight for layer in layers]
+        device = shards[0].device
+        if (
+            device.type != "xpu"
+            or not b60.is_flex_device(device)
+            or not all(w.device == device and w.T.is_contiguous() for w in shards)
+        ):
+            return
+        if cls.shared_weight(layers) is not None:
+            return
+        if len(shards) == 3 and all(w.shape == (2048, 4096) for w in shards):
+            combined = torch.stack([w.T for w in shards])
+            views = combined.unbind(0)
+        elif len(shards) == 2 and all(w.shape == (6144, 4096) for w in shards):
+            combined = torch.cat([w.T for w in shards], dim=1)
+            views = combined.chunk(2, dim=1)
+        else:
+            return
+        for w, view in zip(shards, views, strict=True):
+            w.data = view.T
+
+    @classmethod
+    def shared_weight(cls, layers):
+        first = layers[0].weight
+        if first.ndim != 2 or first.device.type != "xpu":
+            return None
+        n, k = first.shape
+        count = len(layers)
+        if count == 3 and n == 2048:
+            shape, strides = (3, k, n), (k * n, n, 1)
+            row_stride, shard_step = n, k * n
+        elif count == 2 and n == 6144:
+            shape, strides = (k, 2 * n), (2 * n, 1)
+            row_stride, shard_step = 2 * n, n
+        else:
+            return None
+        base = first.untyped_storage().data_ptr()
+        offset = first.storage_offset()
+        for i, layer in enumerate(layers):
+            w = layer.weight
+            if not (
+                w.shape == (n, k)
+                and w.stride() == (1, row_stride)
+                and w.dtype == torch.bfloat16
+                and w.device == first.device
+                and w.untyped_storage().data_ptr() == base
+                and w.storage_offset() == offset + i * shard_step
+            ):
+                return None
+        return first.as_strided(shape, strides)
+
+    @classmethod
+    def for_image(cls, x, layers):
+        if (
+            torch.compiler.is_compiling()
+            or torch.is_grad_enabled()
+            or not torch.is_tensor(x)
+            or x.device.type != "xpu"
+            or x.dtype != torch.bfloat16
+            or x.shape != (1, 4096, 4096)
+            or not x.is_contiguous()
+            or not b60.is_flex_device(x.device)
+            or nn.modules.module._global_forward_pre_hooks
+            or nn.modules.module._global_forward_hooks
+        ):
+            return None
+        if not all(
+            type(layer) is ColumnParallelLinear
+            and type(layer.quant_method) is cls
+            and not layer.training
+            and layer.tp_size == 2
+            and not layer.gather_output
+            and layer.bias is None
+            and layer.weight.device == x.device
+            and "forward" not in layer.__dict__
+            and not layer._forward_pre_hooks
+            and not layer._forward_hooks
+            for layer in layers
+        ):
+            return None
+        return cls.shared_weight(layers)
+
     def apply(self, layer, x, bias=None):
         w = layer.weight
         # oneDNN can choose a different accumulation order on short prefixes.
@@ -420,6 +513,9 @@ class _FlexTP2ColumnMethod(UnquantizedLinearMethod):
             and torch.xpu.get_device_properties(x.device).device_id == 0x56C0
         ):
             w = w.contiguous()
+        elif not w.T.is_contiguous():
+            # A hook or adapter may require an individual image projection.
+            w = w.T.contiguous().T
         return apply_unquantized_linear(x, w, bias)
 
 
@@ -538,6 +634,22 @@ class QwenImage21FeedForward(nn.Module):
                 x, *packed, self.gate_layer.quant_method.group_size, self.out
             )
         if _is_xpu:
+            wide = _FlexTP2ColumnMethod.for_image(x, (self.gate_layer, self.proj))
+            if wide is not None and not _FLEX_GATE_UP.disabled:
+
+                def grouped():
+                    gate, up = (x @ wide).chunk(2, dim=-1)
+                    return b60.fused_pointwise(
+                        gate, up, input_row_padding=gate.shape[-1]
+                    )
+
+                hidden = _FLEX_GATE_UP.run(
+                    grouped,
+                    lambda: nn.functional.silu(self.gate_layer(x)[0]) * self.proj(x)[0],
+                    sig=x.device,
+                    logger=logger,
+                )
+                return self.out(hidden)[0]
             x = prepare_convrot_input((self.gate_layer, self.proj), x)
         gate, value = self.gate_layer(x)[0], self.proj(x)[0]
         if _is_xpu and b60.can_fuse_pair(gate, value):
@@ -715,7 +827,22 @@ class QwenImage21Attention(nn.Module):
 
     def project_qkv(self, x):
         if _is_xpu:
-            x = prepare_convrot_input((self.to_q, self.to_k, self.to_v), x)
+            layers = (self.to_q, self.to_k, self.to_v)
+            batched = _FlexTP2ColumnMethod.for_image(x, layers)
+            if batched is not None and not _FLEX_QKV.disabled:
+                # The expanded input has zero batch stride; BMM reads it once
+                # per projection and writes three individually contiguous rows.
+                projections = _FLEX_QKV.run(
+                    lambda: torch.bmm(x.expand(3, -1, -1), batched).split(1),
+                    lambda: tuple(layer(x)[0] for layer in layers),
+                    sig=x.device,
+                    equal=tensors_equal,
+                    logger=logger,
+                )
+                return tuple(
+                    z.unflatten(-1, (self.heads, self.head_dim)) for z in projections
+                )
+            x = prepare_convrot_input(layers, x)
         q = self.to_q(x)[0].unflatten(-1, (self.heads, self.head_dim))
         k = self.to_k(x)[0].unflatten(-1, (self.heads, self.head_dim))
         v = self.to_v(x)[0].unflatten(-1, (self.heads, self.head_dim))
