@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
     SGLANG_DIFFUSION_CONVROT_INT8_BACKEND: str = "auto"
+    SGLANG_MOSS_XPU_FAST_ROTATION: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS: str | None = None
     SGLANG_DIFFUSION_FLUX3_NATTEN_BACKEND: str | None = None
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
@@ -322,6 +323,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND", "auto"
     ),
+    # Algebraically equivalent butterfly order can change near-tie A8 codes.
+    "SGLANG_MOSS_XPU_FAST_ROTATION": _lazy_bool("SGLANG_MOSS_XPU_FAST_ROTATION"),
     # Path to a Parallel Decoding Distillation head stack (one fused output head
     # per denoise step, produced by fuse_minimax_h3_pdd_heads.py). Set only when serving a
     # PDD-distilled checkpoint; an ordinary run leaves the projection alone.

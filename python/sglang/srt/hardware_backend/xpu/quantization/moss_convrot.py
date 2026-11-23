@@ -55,3 +55,52 @@ def project_packed(x, weight, weight_scale):
         if out is not None:
             return out.view(*x.shape[:-1], weight.shape[0])
     return dynamic_w8a8_linear(x, weight.T, weight_scale)
+
+
+@triton.jit
+def _regular_h4(x, BLOCK: tl.constexpr, STRIDE: tl.constexpr):
+    # In a regular H4 each output has one minus sign, at input i XOR 3.
+    tiles = tl.reshape(x, (BLOCK // (4 * STRIDE), 2, 2, STRIDE))
+    even, odd = tl.split(tl.permute(tiles, (0, 3, 1, 2)))
+    a, c = tl.split(even)
+    b, d = tl.split(odd)
+    ab, cd = a + b, c + d
+    left = tl.join(ab + (c - d), cd + (a - b))
+    right = tl.join(ab + (d - c), cd + (b - a))
+    return tl.reshape(tl.permute(tl.join(left, right), (0, 2, 3, 1)), (BLOCK,))
+
+
+@triton.jit
+def _rotate_pack_rows(
+    X, Q, S, WIDTH: tl.constexpr, GROUP: tl.constexpr, BLOCK: tl.constexpr
+):
+    row = tl.program_id(0)
+    col = tl.arange(0, BLOCK)
+    offsets = row.to(tl.int64) * WIDTH + col
+    x = tl.load(X + offsets, col < WIDTH, 0).to(tl.float32)
+    x = _regular_h4(x, BLOCK, 1)
+    x = _regular_h4(x, BLOCK, 4)
+    if GROUP >= 64:
+        x = _regular_h4(x, BLOCK, 16)
+    if GROUP >= 256:
+        x = _regular_h4(x, BLOCK, 64)
+    if GROUP >= 1024:
+        x = _regular_h4(x, BLOCK, 256)
+    x = x * (1.0 / tl.sqrt(float(GROUP)))
+    bits = tl.abs(x).to(tl.uint32, bitcast=True)
+    peak = tl.max(bits, axis=0).to(tl.float32, bitcast=True)
+    scale = tl.where(peak < 1e-10, 1e-10, peak) * (1.0 / 127)
+    tl.store(Q + offsets, libdevice.rint(tl.div_rn(x, scale)).to(tl.int8), col < WIDTH)
+    tl.store(S + row, scale)
+
+
+def rotate_and_pack(x, group):
+    width = x.size(-1)
+    rows = x.numel() // width
+    values = torch.empty((rows, width), dtype=torch.int8, device=x.device)
+    scales = torch.empty(rows, dtype=torch.float32, device=x.device)
+    with torch.xpu.device(x.device):
+        _rotate_pack_rows[(rows,)](
+            x, values, scales, width, group, triton.next_power_of_2(width), num_warps=16 if width == 8192 else 8
+        )
+    return W8A8Activation(values, scales, x.shape, x.dtype)

@@ -145,6 +145,12 @@ def _situ_native(hidden, gate):
 
 
 def _situ(hidden, gate):
+    if hidden.device.type == "xpu" and not torch.is_grad_enabled():
+        from sglang.kernels.ops.diffusion.norm.moss_xpu import situ_if_supported
+
+        out = situ_if_supported(hidden, gate)
+        if out is not None:
+            return out
     if not can_use_fused_situ_softcap_mul(device=hidden.device, dtype=hidden.dtype):
         return _situ_native(hidden, gate)
     return _SITU_FUSION.run(
@@ -191,6 +197,12 @@ def _attention(q, k, v, rope, heads, attention, attn_mask_meta=None):
 
 
 def _norm_modulate(norm, x, scale, shift):
+    if x.device.type == "xpu" and not torch.is_grad_enabled():
+        from sglang.kernels.ops.diffusion.norm.moss_xpu import norm_finish_if_supported
+
+        out = norm_finish_if_supported(x, norm.weight, scale, shift, 1, rope=False)
+        if out is not None:
+            return out
     if not can_use_rmsnorm_cast_before_weight_modulate(
         device=x.device,
         dtype=x.dtype,
@@ -209,6 +221,12 @@ def _norm_modulate(norm, x, scale, shift):
 
 
 def _norm_rope(norm, x, rope, heads):
+    if x.device.type == "xpu" and not torch.is_grad_enabled():
+        from sglang.kernels.ops.diffusion.norm.moss_xpu import norm_finish_if_supported
+
+        out = norm_finish_if_supported(x, norm.weight, *rope, heads, rope=True)
+        if out is not None:
+            return out
     x = x.unflatten(-1, (heads, -1))
     sin, cos = (part.flatten(0, 1) for part in rope)
     if not can_use_rmsnorm_cast_before_weight_rope(

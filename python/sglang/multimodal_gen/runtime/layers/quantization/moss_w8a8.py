@@ -48,11 +48,20 @@ class ConvRotMethod(DynamicInt8Method):
 
 
 class _DiTConvRotMethod(ConvRotMethod):
+    def __init__(self, group):
+        from sglang.multimodal_gen import envs
+
+        super().__init__(group)
+        self.fast_rotation = envs.SGLANG_MOSS_XPU_FAST_ROTATION
+
     def prepare_input(self, x):
         from sglang.srt.hardware_backend.xpu.quantization.moss_convrot import (
             quantize_rotated,
+            rotate_and_pack,
         )
 
+        if self.fast_rotation and x.is_contiguous() and x.size(-1) % self.group == 0:
+            return rotate_and_pack(x, self.group)
         return quantize_rotated(rotate(x.float(), self.group), x.dtype)
 
     def apply(self, layer, x, bias=None):
@@ -95,7 +104,10 @@ def prepare_moss_qkv_input(proj, x):
 
 class SerializedConvRotConfig(CompressedInt8Config):
     def __init__(self, groups):
-        if not groups or any(v not in (16, 64, 256) for v in groups.values()):
+        if not groups or any(
+            v not in (16, 64, 256) and not (v == 1024 and k.startswith("layers."))
+            for k, v in groups.items()
+        ):
             raise ValueError(
                 "Expected explicit Comfy ConvRot layer names and group sizes"
             )
@@ -150,6 +162,10 @@ def install_moss_projections(model, config, *, text_only=False):
             continue
         original = model.get_submodule(path)
         rows, columns = original.weight.shape
+        if isinstance(config, SerializedConvRotConfig) and columns % config.groups[path]:
+            raise ValueError(
+                f"{path} input width {columns} must divide into rotation groups of {config.groups[path]}"
+            )
         if isinstance(original, nn.Embedding) and isinstance(
             config, SerializedConvRotConfig
         ):
