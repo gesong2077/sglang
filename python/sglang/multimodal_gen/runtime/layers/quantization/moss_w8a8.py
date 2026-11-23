@@ -11,6 +11,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     LinearBase,
     ReplicatedLinear,
+    RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.compressed_int8 import (
     CompressedInt8Config,
@@ -106,6 +107,23 @@ def prepare_convrot_input(layers, x, layer_type=ColumnParallelLinear):
     ):
         return layers[0].quant_method.prepare_input(x)
     return x
+
+
+def can_pack_flex_mlp_output(layer, gate):
+    # Only the measured TP2 shape has a tuned, bit-exact fused pack.
+    return (
+        gate.shape == (1, 4096, 6144)
+        and torch.xpu.get_device_properties(gate.device).device_id == 0x56C0
+        and type(layer) is RowParallelLinear
+        and layer.input_is_parallel
+        and layer.tp_size == 2
+        and isinstance(layer.quant_method, _DiTConvRotMethod)
+        and layer.quant_method.fast_rotation
+        and layer.quant_method.group == 256
+        and layer.bias is None
+        and not layer._forward_pre_hooks
+        and not layer._forward_hooks
+    )
 
 
 def prepare_moss_qkv_input(proj, x):

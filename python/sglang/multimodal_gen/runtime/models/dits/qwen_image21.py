@@ -50,6 +50,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitche
     comfy_kitchen_swiglu_mlp,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.moss_w8a8 import (
+    can_pack_flex_mlp_output,
     prepare_convrot_input,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
@@ -71,8 +72,14 @@ _is_cuda = current_platform.is_cuda()
 _is_xpu = current_platform.is_xpu()
 if _is_xpu:
     from sglang.kernels.ops.diffusion.rope import qwen_image21_b60 as b60
+    from sglang.srt.hardware_backend.xpu.quantization.moss_convrot import (
+        rotate_and_pack,
+    )
 
-_B60_QK = BitExactFusionGate("B60 Q/K RMSNorm + RoPE", per_signature=True)
+_FLEX_SWIGLU_PACK = BitExactFusionGate(
+    "Flex 170 BF16 SwiGLU + ConvRot INT8 pack", per_signature=True
+)
+_XPU_QK = BitExactFusionGate("XPU Q/K RMSNorm + RoPE", per_signature=True)
 _B60_RESIDUAL = BitExactFusionGate("B60 BF16 gated residual")
 _B60_SILU = BitExactFusionGate("B60 BF16 SiLU-mul")
 
@@ -181,7 +188,7 @@ def apply_qk_norm(x, norm):
 
 def apply_qk_norm_rope(x, norm, rope):
     if _is_xpu and b60.can_fuse_qk(x, norm.weight, rope):
-        return _B60_QK.run(
+        return _XPU_QK.run(
             lambda: b60.qk_norm_rope(x, norm.weight, rope, norm.variance_epsilon),
             lambda: apply_rope(norm(x), rope),
             sig=(x.device, x.shape, norm.variance_epsilon),
@@ -493,6 +500,21 @@ class QwenImage21FeedForward(nn.Module):
             x = prepare_convrot_input((self.gate_layer, self.proj), x)
         gate, value = self.gate_layer(x)[0], self.proj(x)[0]
         if _is_xpu and b60.can_fuse_pair(gate, value):
+            if can_pack_flex_mlp_output(self.out, gate):
+                hidden = _FLEX_SWIGLU_PACK.run(
+                    lambda: rotate_and_pack(
+                        gate,
+                        256,
+                        swiglu_value=value,
+                        silu_table=b60.silu_table(gate.device),
+                    ),
+                    lambda: rotate_and_pack(nn.functional.silu(gate) * value, 256),
+                    sig=gate.device,
+                    equal=lambda a, b: torch.equal(a.values, b.values)
+                    and torch.equal(a.scales, b.scales),
+                    logger=logger,
+                )
+                return self.out(hidden)[0]
             # Write the activation in the measured BF16 TP2 down-GEMM layout.
             # Both leading dimensions then avoid a 12 KiB row stride.
             pad = (

@@ -72,12 +72,28 @@ def _regular_h4(x, BLOCK: tl.constexpr, STRIDE: tl.constexpr):
 
 @triton.jit
 def _rotate_pack_rows(
-    X, Q, S, WIDTH: tl.constexpr, GROUP: tl.constexpr, BLOCK: tl.constexpr
+    X,
+    Q,
+    S,
+    WIDTH: tl.constexpr,
+    GROUP: tl.constexpr,
+    BLOCK: tl.constexpr,
+    VALUE=None,
+    SILU_TABLE=None,
+    SWIGLU: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     col = tl.arange(0, BLOCK)
     offsets = row.to(tl.int64) * WIDTH + col
-    x = tl.load(X + offsets, col < WIDTH, 0).to(tl.float32)
+    activation = tl.load(X + offsets, col < WIDTH, 0)
+    if SWIGLU:
+        # The lookup table reproduces ATen's BF16 SiLU for every input bit pattern.
+        # Preserve the following BF16 multiply rounding before the FP32 rotation.
+        bits = activation.to(tl.uint16, bitcast=True).to(tl.int32)
+        gate = tl.load(SILU_TABLE + bits).to(tl.float32)
+        value = tl.load(VALUE + offsets, col < WIDTH, 0).to(tl.float32)
+        activation = (gate * value).to(tl.bfloat16)
+    x = activation.to(tl.float32)
     x = _regular_h4(x, BLOCK, 1)
     x = _regular_h4(x, BLOCK, 4)
     if GROUP >= 64:
@@ -94,7 +110,7 @@ def _rotate_pack_rows(
     tl.store(S + row, scale)
 
 
-def rotate_and_pack(x, group):
+def rotate_and_pack(x, group, *, swiglu_value=None, silu_table=None):
     width = x.size(-1)
     rows = x.numel() // width
     values = torch.empty((rows, width), dtype=torch.int8, device=x.device)
@@ -104,6 +120,15 @@ def rotate_and_pack(x, group):
         warps = {2048: 4, 6144: 16}.get(width, warps)
     with torch.xpu.device(x.device):
         _rotate_pack_rows[(rows,)](
-            x, values, scales, width, group, triton.next_power_of_2(width), num_warps=warps
+            x,
+            values,
+            scales,
+            width,
+            group,
+            triton.next_power_of_2(width),
+            VALUE=swiglu_value,
+            SILU_TABLE=silu_table,
+            SWIGLU=swiglu_value is not None,
+            num_warps=warps,
         )
     return W8A8Activation(values, scales, x.shape, x.dtype)

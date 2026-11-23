@@ -13,7 +13,15 @@ def b60_devices():
     ]
 
 
-@pytest.mark.parametrize("device", b60_devices())
+def flex_devices():
+    return [
+        torch.device(f"xpu:{i}")
+        for i in range(torch.xpu.device_count())
+        if torch.xpu.get_device_properties(i).device_id == 0x56C0
+    ]
+
+
+@pytest.mark.parametrize("device", b60_devices() + flex_devices())
 @pytest.mark.parametrize("row_padding", [0, 32])
 @torch.inference_mode()
 def test_bf16_silu_mul_all_inputs(device, row_padding):
@@ -26,8 +34,11 @@ def test_bf16_silu_mul_all_inputs(device, row_padding):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
 
 
-@pytest.mark.parametrize("device", b60_devices())
-@pytest.mark.parametrize("tokens,heads", [(129, 15), (4096, 16)])
+@pytest.mark.parametrize(
+    "device,tokens,heads",
+    [(dev, 129, 15) for dev in b60_devices()]
+    + [(dev, 4096, 16) for dev in b60_devices() + flex_devices()],
+)
 @torch.inference_mode()
 def test_qk_rounding_and_gated_residual(device, tokens, heads):
     gen = torch.Generator(device=device).manual_seed(1983)
@@ -50,3 +61,24 @@ def test_qk_rounding_and_gated_residual(device, tokens, heads):
     gate = torch.randn(1, 1, x.size(-1), device=device, dtype=x.dtype, generator=gen)
     assert b60.can_fuse_pair(x, update)
     assert torch.equal(b60.fused_pointwise(x, update, gate), x + update * gate)
+
+
+@pytest.mark.parametrize("device", flex_devices())
+@torch.inference_mode()
+def test_flex_swiglu_convrot_pack(device):
+    from sglang.srt.hardware_backend.xpu.quantization.moss_convrot import (
+        rotate_and_pack,
+    )
+
+    generator = torch.Generator(device=device).manual_seed(369)
+    shape = (1, 4096, 6144)
+    gate, value = [
+        torch.randn(shape, dtype=torch.bfloat16, generator=generator, device=device)
+        for _ in range(2)
+    ]
+    expected = rotate_and_pack(torch.nn.functional.silu(gate) * value, 256)
+    actual = rotate_and_pack(
+        gate, 256, swiglu_value=value, silu_table=b60.silu_table(device)
+    )
+    assert torch.equal(actual.values, expected.values)
+    assert torch.equal(actual.scales, expected.scales)
