@@ -2241,6 +2241,11 @@ class USPAttention(nn.Module):
         ctx_attn_metadata = forward_context.attn_metadata
 
         if self.skip_sequence_parallel or get_sequence_parallel_world_size() == 1:
+            prefix_attention = getattr(self.attn_impl, "try_forward_with_kv_prefix", None)
+            if prefix_attention is not None:
+                out = prefix_attention(q, k_prefix, v_prefix, k_suffix, v_suffix)
+                if out is not None:
+                    return out
             k = torch.cat([k_prefix, k_suffix], dim=1)
             v = torch.cat([v_prefix, v_suffix], dim=1)
             return self.attn_impl.forward(q, k, v, ctx_attn_metadata)

@@ -7,12 +7,10 @@ import torch
 
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
-try:
-    from sgl_kernel.flash_attn import flash_attn_varlen_func
+from sgl_kernel import flash_attn as _xpu_fa
 
-    flash_attn_func = flash_attn_varlen_func
-except ImportError as e:
-    raise e
+flash_attn_func = _xpu_fa.flash_attn_varlen_func
+_hpg_flash_attn_prefix = getattr(_xpu_fa, "hpg_flash_attn_prefix", None)
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
@@ -146,6 +144,57 @@ class XPUAttentionImpl(AttentionImpl):
 
         result = out.reshape(bsz, seqlen_q, nheads_q, d)
         return result
+
+    def try_forward_with_kv_prefix(
+        self,
+        query: torch.Tensor,
+        k_prefix: torch.Tensor,
+        v_prefix: torch.Tensor,
+        k_suffix: torch.Tensor,
+        v_suffix: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if (
+            _hpg_flash_attn_prefix is None
+            or self.causal
+            or query.ndim != 4
+            or query.shape[0] != 1
+            or query.shape[1] < 128
+            or query.shape[-1] != 128
+            or query.device.type != "xpu"
+            or query.dtype != torch.bfloat16
+        ):
+            return None
+        for tensor in (k_prefix, v_prefix, k_suffix, v_suffix):
+            if (
+                tensor.ndim != 4
+                or tensor.shape[0] != 1
+                or tensor.shape[-1] != 128
+                or tensor.device != query.device
+                or tensor.dtype != query.dtype
+                or tensor.stride(-1) != 1
+            ):
+                return None
+        heads = k_suffix.shape[2]
+        if (
+            k_prefix.shape != v_prefix.shape
+            or k_suffix.shape != v_suffix.shape
+            or k_prefix.shape[2] != heads
+            or not heads
+            or query.shape[2] % heads
+        ):
+            return None
+        nq = query.shape[1]
+        nk = k_prefix.shape[1] + k_suffix.shape[1]
+        if nk == 0:
+            return None
+        q = _as_fa_input(query, nq, query.shape[2], 128)
+        cu_q = _get_cu_seqlens(q.device.index, 1, nq)
+        cu_k = _get_cu_seqlens(q.device.index, 1, nk)
+        out = _hpg_flash_attn_prefix(
+            q, k_prefix[0], v_prefix[0], k_suffix[0], v_suffix[0],
+            cu_q, cu_k, self.softmax_scale,
+        )
+        return out.unsqueeze(0) if out is not None else None
 
     def forward_varlen(
         self,
