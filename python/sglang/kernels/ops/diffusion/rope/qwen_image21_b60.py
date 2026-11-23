@@ -54,7 +54,20 @@ def can_fuse_qk(x, weight, rope):
 
 
 @triton.jit
-def _b60_inverse_rms(x, BLOCK: tl.constexpr, EPS: tl.constexpr):
+def _qk_kernel(
+    X,
+    W,
+    R,
+    Y,
+    ROWS: tl.constexpr,
+    HEADS: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    col = tl.arange(0, 128)
+    offset = row[:, None] * 128 + col[None, :]
+    x = tl.load(X + offset, row[:, None] < ROWS, 0).to(tl.float32)
     # ATen XPU ReduceKernel<MeanOps, vt=4> assigns a 128-wide row to
     # 32 lanes. Each lane adds four strided squares in order. The subgroup
     # then combines adjacent pairs with increasing shuffle distances.
@@ -68,52 +81,7 @@ def _b60_inverse_rms(x, BLOCK: tl.constexpr, EPS: tl.constexpr):
     a, b = tl.split(tl.reshape(a + b, (BLOCK, 4, 2)))
     a, b = tl.split(tl.reshape(a + b, (BLOCK, 2, 2)))
     a, b = tl.split(tl.reshape(a + b, (BLOCK, 2)))
-    return tl.rsqrt((a + b) * (1.0 / 128) + EPS)
-
-
-@triton.jit
-def _flex_inverse_rms(
-    X, row, ROWS: tl.constexpr, BLOCK: tl.constexpr, EPS: tl.constexpr
-):
-    # ATen's 128-wide contiguous mean on Flex uses eight lanes and four
-    # independent accumulators per lane. Load those strides into registers
-    # directly; transposing the entire 128-wide row to match ATen is expensive.
-    offset = row[:, None] * 128 + tl.arange(0, 8)[None, :]
-    total = tl.full((BLOCK, 8), 0, tl.float32)
-    for register in tl.static_range(4):
-        partial = tl.full((BLOCK, 8), 0, tl.float32)
-        for step in tl.static_range(4):
-            value = tl.load(
-                X + offset + (4 * step + register) * 8, row[:, None] < ROWS, 0
-            ).to(tl.float32)
-            partial += value * value
-        total += partial
-    a, b = tl.split(tl.reshape(total, (BLOCK, 4, 2)))
-    a, b = tl.split(tl.reshape(a + b, (BLOCK, 2, 2)))
-    a, b = tl.split(tl.reshape(a + b, (BLOCK, 2)))
-    return tl.rsqrt((a + b) * (1.0 / 128) + EPS)
-
-
-@triton.jit
-def _qk_kernel(
-    X,
-    W,
-    R,
-    Y,
-    ROWS: tl.constexpr,
-    HEADS: tl.constexpr,
-    EPS: tl.constexpr,
-    BLOCK: tl.constexpr,
-    FLEX: tl.constexpr,
-):
-    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    col = tl.arange(0, 128)
-    offset = row[:, None] * 128 + col[None, :]
-    x = tl.load(X + offset, row[:, None] < ROWS, 0).to(tl.float32)
-    if FLEX:
-        inv = _flex_inverse_rms(X, row, ROWS, BLOCK, EPS)
-    else:
-        inv = _b60_inverse_rms(x, BLOCK, EPS)
+    inv = tl.rsqrt((a + b) * (1.0 / 128) + EPS)
     weight = tl.load(W + col).to(tl.float32)
     x = (x * inv[:, None]).to(tl.bfloat16).to(tl.float32)
     x = (x * weight[None, :]).to(tl.bfloat16).to(tl.float32)
@@ -127,13 +95,50 @@ def _qk_kernel(
     tl.store(Y + offset, tl.reshape(tl.join(re, im), (BLOCK, 128)), row[:, None] < ROWS)
 
 
+@triton.jit
+def _flex_qk_kernel(
+    X, W, R, Y, N: tl.constexpr, H: tl.constexpr, EPS: tl.constexpr, ROWS: tl.constexpr
+):
+    # Match ATen eight-lane, four-register accumulation without moving a full head
+    # between lane layouts. The order of the loads here is significant for Intel IGC.
+    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    offsets = rows[:, None] * 128 + tl.arange(0, 8)[None, :]
+    total = tl.full((ROWS, 8), 0, tl.float32)
+    for reg in tl.static_range(4):
+        partial = tl.full((ROWS, 8), 0, tl.float32)
+        for step in tl.static_range(4):
+            v = tl.load(X + offsets + (step * 4 + reg) * 8, rows[:, None] < N, 0).to(
+                tl.float32
+            )
+            partial += v * v
+        total += partial
+    a, b = tl.split(tl.reshape(total, (ROWS, 4, 2)))
+    a, b = tl.split(tl.reshape(a + b, (ROWS, 2, 2)))
+    a, b = tl.split(tl.reshape(a + b, (ROWS, 2)))
+    inv = tl.rsqrt((a + b) * (1.0 / 128) + EPS)
+    col = tl.arange(0, 128)
+    off = rows[:, None] * 128 + col[None, :]
+    x = tl.load(X + off, rows[:, None] < N, 0).to(tl.float32)
+    w = tl.load(W + col).to(tl.float32)
+    rot = tl.load(R + (rows // H)[:, None] * 128 + col[None, :], rows[:, None] < N, 0)
+    scaled = (x * inv[:, None]).to(tl.bfloat16).to(tl.float32)
+    weighted = (scaled * w[None, :]).to(tl.bfloat16).to(tl.float32)
+    a, b = tl.split(tl.reshape(weighted, (ROWS, 64, 2)))
+    c, d = tl.split(tl.reshape(rot, (ROWS, 64, 2)))
+    real = tl.fma(a, c, -b * d)
+    imag = tl.fma(a, d, b * c)
+    z = tl.reshape(tl.join(real, imag), (ROWS, 128))
+    tl.store(Y + off, z, rows[:, None] < N)
+
+
 def qk_norm_rope(x, weight, rope, eps):
     out = torch.empty_like(x)
     rows = x.numel() // 128
     flex = _is_flex(x.device)
     block = 32 if flex else 16
     with torch.xpu.device(x.device):
-        _qk_kernel[(triton.cdiv(rows, block),)](
+        kernel = _flex_qk_kernel if flex else _qk_kernel
+        kernel[(triton.cdiv(rows, block),)](
             x,
             weight,
             torch.view_as_real(rope),
@@ -142,7 +147,6 @@ def qk_norm_rope(x, weight, rope, eps):
             x.shape[2],
             eps,
             block,
-            flex,
             num_warps=8 if flex else 16,
             enable_fp_fusion=False,
         )
