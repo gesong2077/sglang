@@ -49,6 +49,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitche
     ConvRotInt8ComfyKitchenLinearMethod,
     comfy_kitchen_swiglu_mlp,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.moss_w8a8 import (
+    prepare_convrot_input,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -486,6 +489,8 @@ class QwenImage21FeedForward(nn.Module):
             return comfy_kitchen_swiglu_mlp(
                 x, *packed, self.gate_layer.quant_method.group_size, self.out
             )
+        if _is_xpu:
+            x = prepare_convrot_input((self.gate_layer, self.proj), x)
         gate, value = self.gate_layer(x)[0], self.proj(x)[0]
         if _is_xpu and b60.can_fuse_pair(gate, value):
             # Write the activation in the measured BF16 TP2 down-GEMM layout.
@@ -644,6 +649,8 @@ class QwenImage21Attention(nn.Module):
         return module
 
     def project_qkv(self, x):
+        if _is_xpu:
+            x = prepare_convrot_input((self.to_q, self.to_k, self.to_v), x)
         q = self.to_q(x)[0].unflatten(-1, (self.heads, self.head_dim))
         k = self.to_k(x)[0].unflatten(-1, (self.heads, self.head_dim))
         v = self.to_v(x)[0].unflatten(-1, (self.heads, self.head_dim))

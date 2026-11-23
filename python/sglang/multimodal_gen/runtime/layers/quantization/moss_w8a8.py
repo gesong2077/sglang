@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Load component-local MOSS projections with explicit serialized W8A8 targets."""
+"""Load component-local projections with explicit serialized W8A8 targets."""
 
 from functools import lru_cache
 
@@ -7,7 +7,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.multimodal_gen.runtime.layers.linear import LinearBase, ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    LinearBase,
+    ReplicatedLinear,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.compressed_int8 import (
     CompressedInt8Config,
     DynamicInt8Method,
@@ -48,11 +52,15 @@ class ConvRotMethod(DynamicInt8Method):
 
 
 class _DiTConvRotMethod(ConvRotMethod):
-    def __init__(self, group):
+    def __init__(self, group, fast_rotation=None):
         from sglang.multimodal_gen import envs
 
         super().__init__(group)
-        self.fast_rotation = envs.SGLANG_MOSS_XPU_FAST_ROTATION
+        self.fast_rotation = (
+            envs.SGLANG_MOSS_XPU_FAST_ROTATION
+            if fast_rotation is None
+            else fast_rotation
+        )
 
     def prepare_input(self, x):
         from sglang.srt.hardware_backend.xpu.quantization.moss_convrot import (
@@ -85,21 +93,23 @@ def _can_pack_dit_input(x):
     )
 
 
-def prepare_moss_qkv_input(proj, x):
-    """Share only this forward's activation across three plain ConvRot projections."""
-    if _can_pack_dit_input(x):
-        layers = (proj["q"], proj["k"], proj["v"])
-        if all(
-            type(layer) is _PackedLinear
-            and isinstance(layer.quant_method, _DiTConvRotMethod)
-            and layer.quant_method.group == layers[0].quant_method.group
-            and layer.bias is None
-            and not layer._forward_pre_hooks
-            and not layer._forward_hooks
-            for layer in layers
-        ):
-            return layers[0].quant_method.prepare_input(x)
+def prepare_convrot_input(layers, x, layer_type=ColumnParallelLinear):
+    """Share a packed activation across plain projections within one forward."""
+    if _can_pack_dit_input(x) and all(
+        type(layer) is layer_type
+        and isinstance(layer.quant_method, _DiTConvRotMethod)
+        and layer.quant_method.group == layers[0].quant_method.group
+        and layer.bias is None
+        and not layer._forward_pre_hooks
+        and not layer._forward_hooks
+        for layer in layers
+    ):
+        return layers[0].quant_method.prepare_input(x)
     return x
+
+
+def prepare_moss_qkv_input(proj, x):
+    return prepare_convrot_input((proj["q"], proj["k"], proj["v"]), x, _PackedLinear)
 
 
 class SerializedConvRotConfig(CompressedInt8Config):
@@ -122,7 +132,14 @@ class SerializedConvRotConfig(CompressedInt8Config):
     def from_config(cls, config):
         return cls(config["layer_groups"])
 
+    def supports_input_partition(self, prefix, partition_size):
+        return partition_size % self.groups.get(prefix, 1) == 0
+
     def get_quant_method(self, layer, prefix):
+        if prefix not in self.groups:
+            return super().get_quant_method(layer, prefix)
+        if prefix.startswith("transformer_blocks."):
+            return _DiTConvRotMethod(self.groups[prefix], fast_rotation=True)
         if prefix.startswith("layers."):
             return _DiTConvRotMethod(self.groups[prefix])
         return ConvRotMethod(self.groups[prefix])
@@ -133,7 +150,7 @@ class _PackedLinear(ReplicatedLinear):
         return super().forward(x)[0]
 
 
-class _PackedEmbedding(nn.Module):
+class ConvRotEmbedding(nn.Module):
     def __init__(self, rows, columns, group, dtype):
         super().__init__()
         self.group = group
@@ -169,7 +186,7 @@ def install_moss_projections(model, config, *, text_only=False):
         if isinstance(original, nn.Embedding) and isinstance(
             config, SerializedConvRotConfig
         ):
-            replacement = _PackedEmbedding(
+            replacement = ConvRotEmbedding(
                 rows, columns, config.groups[path], original.weight.dtype
             )
         elif isinstance(original, (LinearBase, nn.Linear)):

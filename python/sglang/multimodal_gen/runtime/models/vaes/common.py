@@ -35,6 +35,14 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 
 
+@lru_cache(maxsize=64)
+def _xpu_blend_weights(extent, dtype, device):
+    # Xe-HPG has no native FP64. Round both Python-double coefficients on the
+    # host, then reuse the small device vectors for every tile of this extent.
+    take = torch.arange(extent, dtype=torch.float64, device="cpu") / extent
+    return (1 - take).to(dtype).to(device), take.to(dtype).to(device)
+
+
 @lru_cache(maxsize=1)
 def _cached_decode_parallel_world_size(
     is_dist_initialized: bool, is_model_parallel_initialized: bool, group_id: int
@@ -216,12 +224,18 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
         opmath = torch.float64 if b.dtype == torch.float64 else torch.float32
         shape = [1] * b.dim()
         shape[dim] = blend_extent
-        take = (
-            torch.arange(blend_extent, device=b.device, dtype=torch.float64)
-            / blend_extent
-        )
-        keep = (1 - take).to(opmath).view(shape)
-        take = take.to(opmath).view(shape)
+        if (
+            b.device.type == "xpu"
+            and not torch.xpu.get_device_properties(b.device).has_fp64
+        ):
+            keep, take = _xpu_blend_weights(blend_extent, opmath, b.device)
+        else:
+            take = (
+                torch.arange(blend_extent, device=b.device, dtype=torch.float64)
+                / blend_extent
+            )
+            keep, take = (1 - take).to(opmath), take.to(opmath)
+        keep, take = keep.view(shape), take.view(shape)
         head = b.narrow(dim, 0, blend_extent)
         tail = a.narrow(dim, a.shape[dim] - blend_extent, blend_extent)
         head.copy_((tail * keep).to(b.dtype) + (head * take).to(b.dtype))

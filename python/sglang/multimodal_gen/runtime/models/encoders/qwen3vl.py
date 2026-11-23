@@ -22,6 +22,10 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.moss_w8a8 import (
+    ConvRotEmbedding,
+    SerializedConvRotConfig,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
     WeightOnlyFP8ColumnParallelLinear,
     WeightOnlyFP8Linear,
@@ -511,7 +515,17 @@ class Qwen3VLTextModel(nn.Module):
         self.vocab_size = config.vocab_size
 
         embedding_prefix = add_prefix("embed_tokens", prefix)
-        if quant_config is not None and quant_config.quantizes_embedding(
+        if (
+            isinstance(quant_config, SerializedConvRotConfig)
+            and embedding_prefix in quant_config.groups
+        ):
+            self.embed_tokens = ConvRotEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config.groups[embedding_prefix],
+                torch.get_default_dtype(),
+            )
+        elif quant_config is not None and quant_config.quantizes_embedding(
             embedding_prefix
         ):
             self.embed_tokens = VocabParallelEmbedding(
@@ -1131,9 +1145,23 @@ class Qwen3VLForConditionalGeneration(TextEncoder):
         self.model = Qwen3VLModel(
             config, quant_config=quant_config, use_tensor_parallel=True, prefix="model"
         )
-        self.lm_head = nn.Linear(
-            config.text_config.hidden_size, config.text_config.vocab_size, bias=False
-        )
+        if (
+            isinstance(quant_config, SerializedConvRotConfig)
+            and "lm_head" in quant_config.groups
+        ):
+            self.lm_head = Qwen3VLQuantizedLinear(
+                config.text_config.hidden_size,
+                config.text_config.vocab_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix="lm_head",
+            )
+        else:
+            self.lm_head = nn.Linear(
+                config.text_config.hidden_size,
+                config.text_config.vocab_size,
+                bias=False,
+            )
         if getattr(config, "tie_word_embeddings", False) or getattr(
             config.text_config, "tie_word_embeddings", False
         ):

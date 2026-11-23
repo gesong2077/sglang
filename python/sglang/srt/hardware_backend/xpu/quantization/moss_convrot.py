@@ -99,8 +99,11 @@ def rotate_and_pack(x, group):
     rows = x.numel() // width
     values = torch.empty((rows, width), dtype=torch.int8, device=x.device)
     scales = torch.empty(rows, dtype=torch.float32, device=x.device)
+    warps = 16 if width == 8192 else 8
+    if group == 256 and torch.xpu.get_device_properties(x.device).device_id == 0x56C0:
+        warps = {2048: 4, 6144: 16}.get(width, warps)
     with torch.xpu.device(x.device):
         _rotate_pack_rows[(rows,)](
-            x, values, scales, width, group, triton.next_power_of_2(width), num_warps=16 if width == 8192 else 8
+            x, values, scales, width, group, triton.next_power_of_2(width), num_warps=warps
         )
     return W8A8Activation(values, scales, x.shape, x.dtype)

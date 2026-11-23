@@ -103,9 +103,18 @@ def qk_norm_rope(x, weight, rope, eps):
     return out
 
 
+@lru_cache
+def _supports_pointwise(device):
+    return _is_b60(device) or torch.xpu.get_device_properties(device).device_id == 0x56C0
+
+
 def can_fuse_pair(x, other):
     return (
-        supports_b60(x)
+        x.device.type == "xpu"
+        and x.dtype is torch.bfloat16
+        and not torch.is_grad_enabled()
+        and not torch.compiler.is_compiling()
+        and _supports_pointwise(x.device)
         and x.ndim == 3
         and x.shape[1] >= 128
         and x.shape == other.shape

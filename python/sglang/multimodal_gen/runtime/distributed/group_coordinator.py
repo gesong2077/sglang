@@ -221,6 +221,17 @@ class GroupCoordinator:
 
         # TODO: fix it for other platforms
         self.device = get_local_torch_device()
+        self.flex_tp2 = None
+        if (
+            group_name == "tp_group"
+            and self.world_size == 2
+            and self.device.type == "xpu"
+        ):
+            from sglang.multimodal_gen.runtime.distributed.device_communicators.flex_tp2 import (
+                FlexTP2Sum,
+            )
+
+            self.flex_tp2 = FlexTP2Sum.try_create(self)
         self.shm_handle = None
         global_world_size = torch.distributed.get_world_size()
         local_size = int(os.environ.get("LOCAL_SIZE", "0"))
@@ -406,6 +417,14 @@ class GroupCoordinator:
         ):
             return diffusion_all_reduce(input_, group_name=self.unique_name)
         else:
+            if (
+                self.flex_tp2 is not None
+                and not async_op
+                and not torch.compiler.is_compiling()
+                and op == torch.distributed.ReduceOp.SUM
+                and self.flex_tp2.supports(input_)
+            ):
+                return self.flex_tp2.all_reduce(input_)
             custom_ar = self.srt_custom_allreduce
             if (
                 not async_op
@@ -875,6 +894,7 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self) -> None:
+        self.flex_tp2 = None
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
