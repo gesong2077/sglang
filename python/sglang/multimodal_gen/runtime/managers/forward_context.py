@@ -27,6 +27,8 @@ class ForwardContext:
         tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     ] = field(default_factory=dict)
 
+    is_denoising: bool = False
+
     @torch.compiler.disable
     def get_trtllm_gen_sequence_metadata(
         self, device_index: int, batch: int, q_len: int, kv_len: int
@@ -69,7 +71,11 @@ def get_forward_context_or_none() -> "ForwardContext | None":
 
 @contextmanager
 def set_forward_context(
-    current_timestep, attn_metadata, forward_batch: Optional["Req"] = None
+    current_timestep,
+    attn_metadata,
+    forward_batch: Optional["Req"] = None,
+    *,
+    is_denoising=False
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -81,6 +87,7 @@ def set_forward_context(
         current_timestep=current_timestep,
         attn_metadata=attn_metadata,
         forward_batch=forward_batch,
+        is_denoising=is_denoising,
     )
 
     try:

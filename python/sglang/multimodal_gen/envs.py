@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
     SGLANG_DIFFUSION_CONVROT_INT8_BACKEND: str = "auto"
     SGLANG_DIFFUSION_FLEX_TP2_SHM: bool = True
+    SGLANG_DIFFUSION_FLEX_TP2_PEER: bool = True
     SGLANG_MOSS_XPU_FAST_ROTATION: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS: str | None = None
     SGLANG_DIFFUSION_FLUX3_NATTEN_BACKEND: str | None = None
@@ -324,6 +325,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_CONVROT_INT8_BACKEND", "auto"
     ),
+    "SGLANG_DIFFUSION_FLEX_TP2_PEER": _lazy_bool("SGLANG_DIFFUSION_FLEX_TP2_PEER", "true"),
     "SGLANG_DIFFUSION_FLEX_TP2_SHM": _lazy_bool("SGLANG_DIFFUSION_FLEX_TP2_SHM", "true"),
     # Algebraically equivalent butterfly order can change near-tie A8 codes.
     "SGLANG_MOSS_XPU_FAST_ROTATION": _lazy_bool("SGLANG_MOSS_XPU_FAST_ROTATION"),

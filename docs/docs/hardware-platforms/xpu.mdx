@@ -58,6 +58,8 @@ pip install --upgrade pip setuptools
 pip install -v ".[dev,diffusion]" --extra-index-url https://download.pytorch.org/whl/xpu
 ```
 
+The optional Flex 170 TP2 bridge verifies the first 32 MiB BF16 denoising sum against oneCCL before using peer DMA-BUF. Set `SGLANG_DIFFUSION_FLEX_TP2_PEER=0` to use host staging for these sums.
+
 ### Install Using Docker
 
 It is recommended to use Docker for setting up the SGLang environment.

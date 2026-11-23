@@ -25,7 +25,8 @@ def test_bf16_truncation_after_fp32_rounding():
         assert torch.equal(out.cpu(), expected)
 
 
-def test_registered_tp2_waits_for_delayed_producers():
+@pytest.mark.parametrize("peer", [False, True])
+def test_registered_tp2_waits_for_delayed_producers(peer):
     """Run under torchrun --standalone --nproc-per-node=2 -m pytest -k delayed_producers."""
     import os
 
@@ -59,9 +60,21 @@ def test_registered_tp2_waits_for_delayed_producers():
         dist.all_reduce(reference, group=group.device_group)
         # Initialize the rounding probe and the first generation. The faulty
         # wait-list barrier only appeared on later generations.
-        group.all_reduce(a.clone())
+        from sglang.multimodal_gen.runtime.managers.forward_context import (
+            set_forward_context,
+        )
+
+        def reduce(value, use_peer=peer):
+            with set_forward_context(0, None, is_denoising=use_peer):
+                return group.all_reduce(value)
+
+        reduce(a.clone())
+        if peer and not group.flex_tp2.registered.peer_ready:
+            pytest.skip(
+                "driver or machine cannot establish and verify the peer inboxes"
+            )
         streams = [torch.xpu.current_stream(device), torch.xpu.Stream(device)]
-        for stream in streams * 2:
+        for iteration, stream in enumerate(streams * 3):
             with torch.xpu.stream(stream):
                 x.fill_(float("nan"))
                 torch.xpu.synchronize(device)
@@ -70,9 +83,67 @@ def test_registered_tp2_waits_for_delayed_producers():
                 for _ in range(4):
                     torch.mm(a, b, out=scratch)
                 x.copy_(a)
-                out = group.all_reduce(x)
+                # Share the same generations across peer and host fallback paths.
+                out = reduce(x, use_peer=peer and iteration % 3 != 1)
                 assert torch.equal(out, reference)
     finally:
         group.destroy()
         if created:
             dist.destroy_process_group()
+
+
+def _peer_setup_worker(rank, rendezvous):
+    """Exercise the real Unix descriptor exchange and asymmetric failures on CPU."""
+    import ctypes
+    import os
+    from types import SimpleNamespace
+    import torch.distributed as dist
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.flex_tp2 import (
+        _RegisteredSum,
+    )
+
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2)
+    try:
+        for failure in ("export", "open", None):
+            transport = _RegisteredSum.__new__(_RegisteredSum)
+            transport.handle = 1
+            transport.peer_ready = None
+            transport.peer_fd = None
+            fd = os.memfd_create("peer-test", os.MFD_CLOEXEC)
+            os.write(fd, bytes([rank]))
+
+            def export(_, output):
+                ctypes.cast(output, ctypes.POINTER(ctypes.c_int))[0] = fd
+                return int(failure == "export" and rank == 1)
+
+            def open_remote(_, remote):
+                assert os.pread(remote, 1, 0) == bytes([1 - rank])
+                return int(failure == "open" and rank == 1)
+
+            def no_op(*args):
+                pass
+
+            transport.library = SimpleNamespace(
+                flex_tp2_peer_export=export,
+                flex_tp2_peer_open=open_remote,
+                flex_tp2_peer_sum=no_op,
+                flex_tp2_sum=SimpleNamespace(argtypes=[]),
+                flex_tp2_peer_close=no_op,
+                flex_tp2_error=lambda: b"injected failure",
+                flex_tp2_destroy=no_op,
+            )
+            ref = transport.connect_peer(rank, 0, dist.group.WORLD, torch.ones(1))
+            assert (ref is not None) == (failure is None)
+            if ref is not None:
+                assert os.get_inheritable(transport.peer_fd) is False
+                transport.close_peer()
+            assert transport.peer_fd is None
+            os.close(fd)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_flex_peer_dma_buf_setup_and_symmetric_fallback(tmp_path):
+    from torch.multiprocessing import spawn
+
+    spawn(_peer_setup_worker, args=(f"file://{tmp_path}/gloo",), nprocs=2)

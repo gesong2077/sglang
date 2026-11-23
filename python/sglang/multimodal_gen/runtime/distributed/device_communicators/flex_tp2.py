@@ -4,7 +4,10 @@
 import ctypes
 import logging
 import os
+import socket
 import tempfile
+import threading
+from contextlib import ExitStack
 from pathlib import Path
 
 import torch
@@ -14,6 +17,9 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context_or_none,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +100,8 @@ class _RegisteredSum:
         ]
         self.library.flex_tp2_destroy.argtypes = [pointer]
         self.library.flex_tp2_destroy.restype = None
+        self.peer_ready = None
+        self.peer_fd = None
         self.staging = staging
         self.scratch = torch.empty(_MAX_BYTES, dtype=torch.uint8, device=device)
         self.handle = self.library.flex_tp2_create(
@@ -106,11 +114,87 @@ class _RegisteredSum:
         if not self.handle:
             raise RuntimeError(self.library.flex_tp2_error().decode())
 
-    def all_reduce(self, x, truncate):
+    def close_peer(self):
+        close = getattr(self.library, "flex_tp2_peer_close", None)
+        if close is not None:
+            close.argtypes = [ctypes.c_void_p]
+            close.restype = None
+            close(self.handle)
+        if self.peer_fd is not None:
+            os.close(self.peer_fd)
+            self.peer_fd = None
+        self.peer_ready = False
+
+    def connect_peer(self, rank, src_rank, group, activation):
+        # _shared_region already established a shared local inode on both ranks.
+        # Both ranks finish every setup phase together, even when just one fails.
+        errors = [None, None]
+        reference = None
+        with ExitStack() as stack:
+            location = [None]
+            try:
+                if not envs.SGLANG_DIFFUSION_FLEX_TP2_PEER:
+                    raise RuntimeError("disabled by configuration")
+                lib = self.library
+                lib.flex_tp2_peer_export.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_int),
+                ]
+                lib.flex_tp2_peer_open.argtypes = [ctypes.c_void_p, ctypes.c_int]
+                lib.flex_tp2_peer_sum.argtypes = lib.flex_tp2_sum.argtypes
+                fd = ctypes.c_int(-1)
+                if lib.flex_tp2_peer_export(self.handle, ctypes.byref(fd)):
+                    raise RuntimeError(lib.flex_tp2_error().decode())
+                sock = stack.enter_context(
+                    socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                )
+                sock.settimeout(30)
+                if rank == 0:
+                    directory = stack.enter_context(tempfile.TemporaryDirectory())
+                    location[0] = str(Path(directory) / "peer")
+                    sock.bind(location[0])
+                    sock.listen(1)
+                error = None
+            except (AttributeError, OSError, RuntimeError) as exc:
+                error = str(exc)
+            dist.all_gather_object(errors, error, group=group)
+            if all(e is None for e in errors):
+                dist.broadcast_object_list(location, src=src_rank, group=group)
+                try:
+                    if rank == 0:
+                        connection, _ = sock.accept()
+                        connection = stack.enter_context(connection)
+                    else:
+                        sock.connect(location[0])
+                        connection = sock
+                    connection.settimeout(30)
+                    socket.send_fds(connection, [b"F"], [fd.value])
+                    message, fds, _, _ = socket.recv_fds(connection, 1, 1)
+                    if message != b"F" or len(fds) != 1:
+                        for received in fds:
+                            os.close(received)
+                        raise RuntimeError("invalid peer DMA-BUF descriptor")
+                    self.peer_fd = fds[0]
+                    os.set_inheritable(self.peer_fd, False)
+                    if lib.flex_tp2_peer_open(self.handle, self.peer_fd):
+                        raise RuntimeError(lib.flex_tp2_error().decode())
+                    # A rank may fit the inbox but not the first-sight reference.
+                    # Include this allocation in the collective setup decision.
+                    reference = activation.clone()
+                except (AttributeError, OSError, RuntimeError) as exc:
+                    error = str(exc)
+                dist.all_gather_object(errors, error, group=group)
+        if any(e is not None for e in errors):
+            self.close_peer()
+            if rank == 0:
+                logger.info("Flex TP2 retains registered host DMA: %s", errors)
+            return None
+        return reference
+
+    def all_reduce(self, x, truncate, *, peer=False):
         stream = torch.xpu.current_stream(x.device)
-        if self.library.flex_tp2_sum(
-            self.handle, stream.sycl_queue, x.data_ptr(), x.numel(), truncate
-        ):
+        run = self.library.flex_tp2_peer_sum if peer else self.library.flex_tp2_sum
+        if run(self.handle, stream.sycl_queue, x.data_ptr(), x.numel(), truncate):
             # A collective has started. Retrying locally could double-add or
             # leave the other rank waiting for the wrong generation.
             raise RuntimeError(self.library.flex_tp2_error().decode())
@@ -120,6 +204,8 @@ class _RegisteredSum:
     def __del__(self):
         if getattr(self, "handle", None):
             self.library.flex_tp2_destroy(self.handle)
+            if self.peer_fd is not None:
+                os.close(self.peer_fd)
 
 
 class FlexTP2Sum:
@@ -127,6 +213,8 @@ class FlexTP2Sum:
         self.registered = registered
         self.staging = staging
         self.rank = coordinator.rank_in_group
+        self.src_rank = coordinator.ranks[0]
+        self._submit_lock = threading.Lock()
         self.group = coordinator.cpu_group
         self.device_group = coordinator.device_group
         self.device_index = torch.xpu.current_stream(coordinator.device).device_index
@@ -139,8 +227,8 @@ class FlexTP2Sum:
         props = torch.xpu.get_device_properties(coordinator.device)
         available = envs.SGLANG_DIFFUSION_FLEX_TP2_SHM and props.device_id == 0x56C0
         permissions = [None, None]
-        dist.all_gather_object(permissions, available, group=group)
-        if not all(permissions):
+        dist.all_gather_object(permissions, (available, str(props.uuid)), group=group)
+        if not all(allowed for allowed, _ in permissions):
             return None
 
         # Four payload slots (two generations) plus an unregistered control page.
@@ -155,6 +243,8 @@ class FlexTP2Sum:
             errors = [None, None]
             dist.all_gather_object(errors, error, group=group)
             if all(e is None for e in errors):
+                if permissions[0][1] == permissions[1][1]:
+                    registered.peer_ready = False
                 if rank == 0:
                     logger.info("Flex TP2 uses registered host DMA")
                 return cls(None, coordinator, registered)
@@ -179,6 +269,13 @@ class FlexTP2Sum:
         )
 
     def all_reduce(self, x):
+        # Each process must enter collectives in the same order as its peers.
+        # ctypes releases the GIL. Keep setup, sequence counters and bank
+        # publication serialized if more than one local thread submits work.
+        with self._submit_lock:
+            return self._all_reduce(x)
+
+    def _all_reduce(self, x):
         # oneCCL can either truncate or round BF16 depending on its selected
         # transport. Probe the actual size once so switching does not change it.
         if x.numel() not in self.round_toward_zero:
@@ -186,7 +283,40 @@ class FlexTP2Sum:
             dist.all_reduce(probe, group=self.device_group)
             self.round_toward_zero[x.numel()] = probe.view(-1)[0].item() == 1.0
         if self.registered is not None:
-            return self.registered.all_reduce(x, self.round_toward_zero[x.numel()])
+            truncate = self.round_toward_zero[x.numel()]
+            ctx = get_forward_context_or_none()
+            direct = x.nbytes == _MAX_BYTES and ctx is not None and ctx.is_denoising
+            if direct and self.registered.peer_ready is None:
+                reference = self.registered.connect_peer(
+                    self.rank, self.src_rank, self.group, x
+                )
+                if reference is not None:
+                    # Verify the first real payload before trusting these driver mappings.
+                    # Use the saved reference on both ranks if either one disagrees.
+                    self.registered.all_reduce(x, truncate, peer=True)
+                    dist.all_reduce(reference, group=self.device_group)
+                    exact = torch.equal(
+                        x.view(torch.int16), reference.view(torch.int16)
+                    )
+                    agreement = [None, None]
+                    dist.all_gather_object(agreement, exact, group=self.group)
+                    if all(agreement):
+                        self.registered.peer_ready = True
+                        if self.rank == 0:
+                            logger.info(
+                                "Flex TP2 verified 32 MiB DiT sums through peer DMA-BUF"
+                            )
+                    else:
+                        self.registered.close_peer()
+                        x.copy_(reference)
+                        if self.rank == 0:
+                            logger.warning(
+                                "Peer DMA-BUF verification failed; using registered host DMA"
+                            )
+                    return x
+            return self.registered.all_reduce(
+                x, truncate, peer=direct and self.registered.peer_ready
+            )
         rows = self.staging[:, : x.numel()]
         rows[self.rank].view_as(x).copy_(x)
         dist.barrier(group=self.group)

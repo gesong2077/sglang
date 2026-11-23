@@ -2217,6 +2217,7 @@ class DenoisingStage(PipelineStage):
                 current_timestep=timestep_index,
                 attn_metadata=attn_metadata,
                 forward_batch=batch,
+                is_denoising=True,
             ):
                 raw = self._predict_noise(
                     current_model=current_model,
