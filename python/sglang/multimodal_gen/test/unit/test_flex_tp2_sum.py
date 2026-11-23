@@ -25,9 +25,9 @@ def test_bf16_truncation_after_fp32_rounding():
         assert torch.equal(out.cpu(), expected)
 
 
-@pytest.mark.parametrize("peer", [False, True])
-def test_registered_tp2_waits_for_delayed_producers(peer):
-    """Run under torchrun --standalone --nproc-per-node=2 -m pytest -k delayed_producers."""
+@pytest.fixture(scope="module")
+def flex_tp2_group():
+    """Keep one Gloo/XCCL rendezvous for both transports in a torchrun process."""
     import os
 
     import torch.distributed as dist
@@ -51,45 +51,54 @@ def test_registered_tp2_waits_for_delayed_producers(peer):
         [[0, 1]], rank, "xccl", use_device_communicator=False, group_name="tp_group"
     )
     try:
-        if group.flex_tp2 is None or group.flex_tp2.registered is None:
-            pytest.skip("requires the registered DMA bridge on both ranks")
-        x = torch.empty((4096, 4096), device=device, dtype=torch.bfloat16)
-        a, b = torch.randn_like(x), torch.randn_like(x)
-        scratch = torch.empty_like(x)
-        reference = a.clone()
-        dist.all_reduce(reference, group=group.device_group)
-        # Initialize the rounding probe and the first generation. The faulty
-        # wait-list barrier only appeared on later generations.
-        from sglang.multimodal_gen.runtime.managers.forward_context import (
-            set_forward_context,
-        )
-
-        def reduce(value, use_peer=peer):
-            with set_forward_context(0, None, is_denoising=use_peer):
-                return group.all_reduce(value)
-
-        reduce(a.clone())
-        if peer and not group.flex_tp2.registered.peer_ready:
-            pytest.skip(
-                "driver or machine cannot establish and verify the peer inboxes"
-            )
-        streams = [torch.xpu.current_stream(device), torch.xpu.Stream(device)]
-        for iteration, stream in enumerate(streams * 3):
-            with torch.xpu.stream(stream):
-                x.fill_(float("nan"))
-                torch.xpu.synchronize(device)
-                # Delay the current stream's actual producer. The copy of a
-                # must complete before the bridge reads x on this rank.
-                for _ in range(4):
-                    torch.mm(a, b, out=scratch)
-                x.copy_(a)
-                # Share the same generations across peer and host fallback paths.
-                out = reduce(x, use_peer=peer and iteration % 3 != 1)
-                assert torch.equal(out, reference)
+        yield group, device
     finally:
         group.destroy()
         if created:
             dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("peer", [False, True])
+def test_registered_tp2_waits_for_delayed_producers(peer, flex_tp2_group):
+    """Run under torchrun --standalone --nproc-per-node=2 -m pytest -k delayed_producers."""
+    import torch.distributed as dist
+
+    group, device = flex_tp2_group
+    if group.flex_tp2 is None or group.flex_tp2.registered is None:
+        pytest.skip("requires the registered DMA bridge on both ranks")
+    x = torch.empty((4096, 4096), device=device, dtype=torch.bfloat16)
+    a, b = torch.randn_like(x), torch.randn_like(x)
+    scratch = torch.empty_like(x)
+    reference = a.clone()
+    dist.all_reduce(reference, group=group.device_group)
+    # Initialize the rounding probe and the first generation. The faulty
+    # wait-list barrier only appeared on later generations.
+    from sglang.multimodal_gen.runtime.managers.forward_context import (
+        set_forward_context,
+    )
+
+    def reduce(value, use_peer=peer):
+        with set_forward_context(0, None, is_denoising=use_peer):
+            return group.all_reduce(value)
+
+    reduce(a.clone())
+    if peer and not group.flex_tp2.registered.peer_ready:
+        pytest.skip(
+            "driver or machine cannot establish and verify the peer inboxes"
+        )
+    streams = [torch.xpu.current_stream(device), torch.xpu.Stream(device)]
+    for iteration, stream in enumerate(streams * 3):
+        with torch.xpu.stream(stream):
+            x.fill_(float("nan"))
+            torch.xpu.synchronize(device)
+            # Delay the current stream's actual producer. The copy of a
+            # must complete before the bridge reads x on this rank.
+            for _ in range(4):
+                torch.mm(a, b, out=scratch)
+            x.copy_(a)
+            # Share the same generations across peer and host fallback paths.
+            out = reduce(x, use_peer=peer and iteration % 3 != 1)
+            assert torch.equal(out, reference)
 
 
 def _peer_setup_worker(rank, rendezvous):
