@@ -7,7 +7,6 @@
 
 #include <chrono>
 #include <cstdint>
-#include <new>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -29,7 +28,7 @@ F lookup(ze_driver_handle_t driver, const char* name) {
 // The first four slots hold two generations of two rank-local messages. The
 // final page is control memory, with one host-written counter per cache line.
 struct Context {
-    sycl::queue tx;
+    sycl::queue owner;
     uint16_t *host, *peer;
     uint64_t* flags;
     int rank;
@@ -40,7 +39,7 @@ struct Context {
     Release release;
 
     Context(sycl::queue& q, void* data, void* scratch, int r, size_t bytes)
-        : tx(q.get_context(), q.get_device(), sycl::property::queue::in_order{}),
+        : owner(q),
           host(static_cast<uint16_t*>(data)), peer(static_cast<uint16_t*>(scratch)),
           flags(reinterpret_cast<uint64_t*>(host + 4 * (bytes / 2))),
           rank(r), capacity(bytes / 2) {
@@ -63,23 +62,28 @@ struct Context {
 
     ~Context() {
         // Keep the Python-owned host mapping and XPU scratch alive through DMA.
-        tx.wait();
         if (sequence) consumer.wait();
         release(driver, host);
     }
 
     void run(sycl::queue& q, uint16_t* x, size_t count, bool truncate) {
         if (!count || count > capacity || !q.is_in_order() ||
-            q.get_device() != tx.get_device() || q.get_context() != tx.get_context())
+            q.get_device() != owner.get_device() || q.get_context() != owner.get_context())
             throw std::invalid_argument("unsupported queue or payload");
 
-        // Include the actual caller stream's producers. On a stream change, also
-        // wait for the last consumer of our reusable device scratch.
-        auto ready = sequence ? q.ext_oneapi_submit_barrier({consumer})
-                              : q.ext_oneapi_submit_barrier();
+        // Submit the copy itself in order on the actual caller's queue. A
+        // barrier that explicitly waits for the previous consumer alone is not
+        // a completion event for later producers on this queue. Another queue
+        // waiting on such a barrier can publish the old contents of x.
+        auto* bank = host + ((sequence + 1) & 1) * 2 * capacity;
+        auto* local = bank + rank * capacity;
+        if (sequence) {
+            // The preceding consumer can belong to a different caller stream.
+            q.memcpy(local, x, count * 2, consumer).wait_and_throw();
+        } else {
+            q.memcpy(local, x, count * 2).wait_and_throw();
+        }
         ++sequence;
-        auto* bank = host + (sequence & 1) * 2 * capacity;
-        tx.memcpy(bank + rank * capacity, x, count * 2, ready).wait_and_throw();
         __atomic_store_n(flags + 8 * rank, sequence, __ATOMIC_RELEASE);
         // An advance to generation g implies that our read of g-1 finished.
         // Waiting for the peer's g before returning therefore protects its

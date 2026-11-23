@@ -48,10 +48,10 @@ git checkout <YOUR-DESIRED-VERSION>
 cd python
 cp pyproject_xpu.toml pyproject.toml
 
-# For two Flex 170 cards serving diffusion models, build the registered host
-# DMA bridge before packaging. Activate oneAPI icpx matching PyTorch's SYCL
-# runtime and install Level Zero development headers and the loader first.
-ICPX="$(command -v icpx)" bash sglang/srt/hardware_backend/xpu/kernels/build_flex_tp2_sum.sh
+# Optional for two Flex 170 cards serving diffusion models. With Level Zero
+# development files installed and an icpx matching PyTorch's SYCL runtime
+# active, uncomment the following command to build the TP2 bridge into the wheel.
+# ICPX="$(command -v icpx)" bash sglang/srt/hardware_backend/xpu/kernels/build_flex_tp2_sum.sh
 
 # Install SGLang dependent libs, and build SGLang main package
 pip install --upgrade pip setuptools
