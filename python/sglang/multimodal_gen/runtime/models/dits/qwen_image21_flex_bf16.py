@@ -225,11 +225,28 @@ def _decline(owner, state, exc=None):
 def qkv(attn, x, column_type):
     layers = (attn.to_q, attn.to_k, attn.to_v)
     state = _active(attn, x)
-    if state is None or x.shape != _IMAGE or not _unobserved(attn, *layers):
+    if state is None or not _unobserved(attn, *layers):
         return None
     if not all(type(layer) is ColumnParallelLinear for layer in layers):
         return None
     packed = _available(attn, layers, x.device)
+    if x.shape != _IMAGE:
+        if (
+            packed is not None
+            and x.ndim == 3
+            and x.shape[0] == 1
+            and 0 < x.shape[1] <= 128
+            and x.shape[2] == 4096
+            and all(type(layer.quant_method) is HostLinear for layer in layers)
+        ):
+            # HostLinear uses contiguous [N,K] weights at short M. Restore the
+            # same BF16 words on-device and keep the three original reductions.
+            matrix = native.unpack_weight(packed, 4096, 6144)
+            return tuple(
+                F.linear(x, part).unflatten(-1, (attn.heads, attn.head_dim))
+                for part in matrix.chunk(3)
+            )
+        return None
     if packed is not None and all(
         type(layer.quant_method) is HostLinear for layer in layers
     ):
@@ -271,6 +288,18 @@ class PackedOutput(HostLinear):
     def apply(self, layer, x, bias=None):
         state = _active(layer, x)
         layers = (layer,)
+        if (
+            state is not None
+            and x.ndim == 3
+            and x.shape[0] == 1
+            and 0 < x.shape[1] <= 128
+            and x.shape[2] == 2048
+            and bias is None
+            and _unobserved(layer)
+        ):
+            packed = _available(layer, layers, x.device)
+            if packed is not None:
+                return F.linear(x, native.unpack_weight(packed, 2048, 4096))
         if (
             state is not None
             and x.shape == (1, 4096, 2048)

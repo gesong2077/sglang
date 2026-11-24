@@ -83,3 +83,32 @@ def test_unsupported_hook_and_device_use_regular_module():
     linear.eval()
     assert layouts._unobserved(linear)
     assert layouts._active(linear, torch.zeros(1)) is None
+
+
+def test_short_prefix_uses_restored_weights_and_obeys_hooks(monkeypatch):
+    class Column(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.quant_method = layouts.HostLinear()
+            self.eval()
+
+    attn = nn.Module()
+    attn.to_q, attn.to_k, attn.to_v = Column(), Column(), Column()
+    attn.heads, attn.head_dim = 16, 128
+    attn.eval()
+    monkeypatch.setattr(layouts, "ColumnParallelLinear", Column)
+    monkeypatch.setattr(layouts, "_active", lambda *_: {})
+    handle = object()
+    monkeypatch.setattr(layouts, "_available", lambda *_: handle)
+    # Meta tensors exercise the real linear and reshape geometry without a GPU.
+    restore = Mock(return_value=torch.empty(6144, 4096, device="meta"))
+    monkeypatch.setattr(layouts.native, "unpack_weight", restore)
+    x = torch.empty(1, 32, 4096, device="meta")
+    projections = layouts.qkv(attn, x, None)
+    assert all(v.shape == (1, 32, 16, 128) for v in projections)
+    restore.assert_called_once_with(handle, 4096, 6144)
+    with attn.to_q.register_forward_hook(lambda *_: None):
+        assert layouts.qkv(attn, x, None) is None
+    monkeypatch.setattr(layouts, "_available", lambda *_: None)
+    assert layouts.qkv(attn, x, None) is None
+    assert restore.call_count == 1

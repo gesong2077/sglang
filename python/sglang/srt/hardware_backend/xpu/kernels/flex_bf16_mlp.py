@@ -187,11 +187,12 @@ def pack_weight(wide, k, n):
     return packed
 
 
-def unpack_gate_up(packed):
-    plan = _plan(packed.device)
+def unpack_weight(packed, k, n):
+    """Restore an opaque oneDNN projection as canonical contiguous BF16 [N, K]."""
+    plan = _plan(packed.device, k, n)
     if packed.numel() != plan.packed_bytes or packed.dtype != torch.uint8:
-        raise ValueError("invalid packed Flex gate/up weight")
-    output = packed.new_empty((12288, 4096), dtype=torch.bfloat16)
+        raise ValueError("invalid packed Flex projection weight")
+    output = packed.new_empty((n, k), dtype=torch.bfloat16)
     stream = torch.xpu.current_stream(packed.device)
     if plan.lib.flex_mlp_unpack(
         plan.handle, stream.sycl_queue, packed.data_ptr(), output.data_ptr()
@@ -199,6 +200,10 @@ def unpack_gate_up(packed):
         raise RuntimeError(plan.lib.flex_mlp_error().decode())
     packed.record_stream(stream)
     return output
+
+
+def unpack_gate_up(packed):
+    return unpack_weight(packed, 4096, 12288)
 
 
 def _packed_weight(x, wide, gate, up):
