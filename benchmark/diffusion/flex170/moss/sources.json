@@ -1,0 +1,20 @@
+[
+  {
+    "local": "alpaca-en.csv",
+    "url": "https://modelscope.cn/api/v1/datasets/AI-ModelScope/alpaca-gpt4-data-en/repo/?Revision=7989a4b88582e9dcb022229a3654eefd883b8e99&FilePath=train.csv",
+    "revision": "7989a4b88582e9dcb022229a3654eefd883b8e99",
+    "sha256": "14190524a8ecc896321f944d61b1be7dccbe91b2963e1d625e037ae01b597a34"
+  },
+  {
+    "local": "alpaca-zh.csv",
+    "url": "https://modelscope.cn/api/v1/datasets/AI-ModelScope/alpaca-gpt4-data-zh/repo/?Revision=6ac8d22dfecd1a4a590822d2688df05acc2203ef&FilePath=train.csv",
+    "revision": "6ac8d22dfecd1a4a590822d2688df05acc2203ef",
+    "sha256": "8383d6dacfd4f03a99b29ecf0e18a21b13fc46e46acf57a7436d1562fb144a0d"
+  },
+  {
+    "local": "llava-detail.json",
+    "url": "https://modelscope.cn/api/v1/datasets/AI-ModelScope/llava-instruct-150k/repo/?Revision=66d3e067ecb214d376f7f83517a159d1bc999062&FilePath=detail_23k.json",
+    "revision": "66d3e067ecb214d376f7f83517a159d1bc999062",
+    "sha256": "e6e0ab72875de62410ed0b85e619efc8ebbb2f1469a110648009d49105ac01c0"
+  }
+]

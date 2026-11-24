@@ -1,0 +1,22 @@
+{
+  "qwen": {
+    "prompt": "A small blue sailboat anchored on a still lake, pine trees reflected in the water, watercolor on white paper.",
+    "negative_prompt": "",
+    "size": "1024x1024",
+    "n": 1,
+    "seed": 42,
+    "guidance_scale": 1.0,
+    "response_format": "b64_json",
+    "output_format": "png"
+  },
+  "moss": {
+    "prompt": "A documentary photograph of a red enamel teapot beside two blue ceramic cups on a wooden windowsill. Outside the rain-streaked window is a green hillside. A cream paper label on the teapot reads TEA. Soft morning light from the left, realistic reflections and fine texture.",
+    "negative_prompt": "",
+    "size": "768x768",
+    "n": 1,
+    "seed": 42,
+    "guidance_scale": 3.0,
+    "response_format": "b64_json",
+    "output_format": "png"
+  }
+}

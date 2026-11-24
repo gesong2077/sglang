@@ -1,0 +1,46 @@
+{
+  "Qwen-Image-2.1": {
+    "transformer": {
+      "file": "qwen_image_2.1_int8_convrot.safetensors",
+      "tensors": 521,
+      "int8_layers": 224,
+      "groups": {
+        "256": 224
+      },
+      "payload_sha256": "7989139669fb195c251a71c9a7543cdef15ac9ae1b688b17fd7391900315b9ea",
+      "attention_markers": 0
+    },
+    "text_encoder": {
+      "file": "qwen3vl_8b_int8_convrot.safetensors",
+      "tensors": 1004,
+      "int8_layers": 254,
+      "groups": {
+        "256": 254
+      },
+      "payload_sha256": "dc283ac26ceb2180e10c81dc166f45fdde53454cd1f47b3a343dbe6bcc940a3b",
+      "attention_markers": 0
+    }
+  },
+  "Qwen-Image-2.1-Turbo": {
+    "transformer": {
+      "file": "qwen_image_2.1_turbo_int8_convrot.safetensors",
+      "tensors": 521,
+      "int8_layers": 224,
+      "groups": {
+        "256": 224
+      },
+      "payload_sha256": "d5f61dd10424b866da7193c7831d4c3daca14814a563b48a2b7dc485b000a04e",
+      "attention_markers": 31
+    },
+    "text_encoder": {
+      "file": "qwen3vl_8b_int8_convrot.safetensors",
+      "tensors": 1004,
+      "int8_layers": 254,
+      "groups": {
+        "256": 254
+      },
+      "payload_sha256": "dc283ac26ceb2180e10c81dc166f45fdde53454cd1f47b3a343dbe6bcc940a3b",
+      "attention_markers": 0
+    }
+  }
+}

@@ -1,0 +1,76 @@
+{
+  "base-bf16": {
+    "model": "Qwen-Image-2.1",
+    "steps": 40,
+    "hot_requests": 2,
+    "rgba_sha256": "d226451ce6ab51599cd5ab0ad4ab9139d650194888ebb0cbecdf5bb97b07917f",
+    "priming_rgba_sha256": "96257e2b6ecb8d75bb8e626fee4d92ad3477d133365d2634668ef0bfbbde89dd",
+    "rank_operations": [
+      1321194202595328,
+      1321194202595328
+    ]
+  },
+  "turbo-bf16": {
+    "model": "Qwen-Image-2.1-Turbo",
+    "steps": 8,
+    "hot_requests": 3,
+    "rgba_sha256": "4970f833b5ac3323f3a33f65c82668b2fdfafcad9f0bf2623cd0c53b15e9af3b",
+    "priming_rgba_sha256": "4970f833b5ac3323f3a33f65c82668b2fdfafcad9f0bf2623cd0c53b15e9af3b",
+    "rank_operations": [
+      264419579789312,
+      264419579789312
+    ]
+  },
+  "base-int8": {
+    "model": "Qwen-Image-2.1-int8-convrot-w8a8",
+    "steps": 40,
+    "hot_requests": 2,
+    "rgba_sha256": "7b3d83e71eeb5d4ff3036071bbbbbba82b6e22cfa127da4f032cfb2e2c467d9a",
+    "priming_rgba_sha256": "d6303d862e6e7f57069a731af193dcb6fba15ec9f3a5596495566a7a48a3661e",
+    "rank_operations": [
+      1143715431186432,
+      1143715431186432
+    ]
+  },
+  "turbo-int8": {
+    "model": "Qwen-Image-2.1-Turbo-int8-convrot-w8a8",
+    "steps": 8,
+    "hot_requests": 3,
+    "rgba_sha256": "4f6d8359d62fb31dae1f89f146dca35ad18ac40b56756a36ad2a4ee801849839",
+    "priming_rgba_sha256": "4f6d8359d62fb31dae1f89f146dca35ad18ac40b56756a36ad2a4ee801849839",
+    "rank_operations": [
+      228921756876800,
+      228921756876800
+    ]
+  },
+  "moss-original": {
+    "model": "MOSS-Image-SFT",
+    "steps": 50,
+    "hot_requests": 2,
+    "rgba_sha256": "6115018d5171164100bbb599f7445292f254e31d018d801a5186a94e794c7ccc"
+  },
+  "moss-both": {
+    "model": "MOSS-Image-SFT-DiT-text_encoder-int8-convrot-w8a8",
+    "steps": 50,
+    "hot_requests": 2,
+    "rgba_sha256": "74c2a3ef4a15d4de1f6bc78a6fe4e840bf8e97c01fd9684e83bb4e018a824d10"
+  },
+  "moss-comfy": {
+    "model": "MOSS-Image-SFT-text_encoder-int8-convrot-w8a8",
+    "steps": 50,
+    "hot_requests": 2,
+    "rgba_sha256": "39c08daa797833e41728e5ef93971116cbd092e342e580e5d9c5d43c0a39e9da"
+  },
+  "moss-rtn": {
+    "model": "MOSS-Image-SFT-text_encoder-int8-autoround-w8a8",
+    "steps": 50,
+    "hot_requests": 2,
+    "rgba_sha256": "1530d1e56e73ecbf4153918d5ebcbcc6e3064a011339d6635a91b528d15e0ec5"
+  },
+  "moss-gptq": {
+    "model": "MOSS-Image-SFT-text_encoder-int8-gptq-w8a8",
+    "steps": 50,
+    "hot_requests": 2,
+    "rgba_sha256": "9769a23f767f80d8dcc4123fb2b2d2576d79fa9905c7fd9817d43da944d5a489"
+  }
+}
