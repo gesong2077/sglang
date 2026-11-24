@@ -16,18 +16,21 @@ struct Plan {
     matmul::primitive_desc descriptor;
     matmul product;
     reorder weight_reorder;
+    memory::desc unpacked;
+    reorder restore;
 
-    explicit Plan(sycl::queue &queue)
+    Plan(sycl::queue &queue, int k, int n, bool transpose)
         : device(sycl_interop::make_engine(queue.get_device(), queue.get_context())),
-          input({4096, 4096}, dtype::bf16, tag::ab), canonical({4096, 12288}, dtype::bf16, tag::ab),
-          output({4096, 12288}, dtype::bf16, tag::ab) {
+          input({4096, k}, dtype::bf16, tag::ab), canonical({k, n}, dtype::bf16, transpose ? tag::ba : tag::ab),
+          output({4096, n}, dtype::bf16, tag::ab), unpacked({k, n}, dtype::bf16, tag::ba) {
         primitive_attr attr;
         attr.set_scratchpad_mode(scratchpad_mode::user);
         descriptor = matmul::primitive_desc(
-            device, input, memory::desc({4096, 12288}, dtype::bf16, tag::any), output, attr);
+            device, input, memory::desc({k, n}, dtype::bf16, tag::any), output, attr);
         product = matmul(descriptor);
         weight_reorder =
             reorder(reorder::primitive_desc(device, canonical, device, descriptor.weights_desc()));
+        restore = reorder(reorder::primitive_desc(device, descriptor.weights_desc(), device, unpacked));
     }
     memory tensor(const memory::desc &desc, void *address) {
         return sycl_interop::make_memory(desc, device, sycl_interop::memory_kind::usm, address);
@@ -37,12 +40,27 @@ struct Plan {
 extern "C" {
 const char *flex_mlp_error() { return last_error.c_str(); }
 
-void *flex_mlp_create(void *queue) {
+void *flex_projection_create(void *queue, int k, int n, bool transpose) {
     try {
-        return new Plan(*static_cast<sycl::queue *>(queue));
+        return new Plan(*static_cast<sycl::queue *>(queue), k, n, transpose);
     } catch (const std::exception &e) {
         last_error = e.what();
         return nullptr;
+    }
+}
+void *flex_mlp_create(void *queue) { return flex_projection_create(queue, 4096, 12288, false); }
+
+int flex_mlp_unpack(void *handle, void *queue, void *packed, void *plain) {
+    try {
+        auto &plan = *static_cast<Plan *>(handle);
+        auto stream = sycl_interop::make_stream(plan.device, *static_cast<sycl::queue *>(queue));
+        sycl_interop::execute(plan.restore, stream,
+                              {{DNNL_ARG_FROM, plan.tensor(plan.descriptor.weights_desc(), packed)},
+                               {DNNL_ARG_TO, plan.tensor(plan.unpacked, plain)}});
+        return 0;
+    } catch (const std::exception &e) {
+        last_error = e.what();
+        return -1;
     }
 }
 void flex_mlp_destroy(void *plan) { delete static_cast<Plan *>(plan); }

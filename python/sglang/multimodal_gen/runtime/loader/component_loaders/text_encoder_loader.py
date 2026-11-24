@@ -48,6 +48,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.quanto_int8_confi
     inspect_quanto_int8_checkpoint,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.gguf import GGUFConfig
+from sglang.multimodal_gen.runtime.layers.quantization.moss_w8a8 import SerializedConvRotConfig
 from sglang.multimodal_gen.runtime.layers.quantization.quanto_int8 import (
     normalize_quanto_int8_weights,
 )
@@ -693,7 +694,30 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
             )
             component_starts_on_cpu = False
 
-        if component_starts_on_cpu:
+        # Qwen's non-checkpoint rotary buffers inherit the construction device.
+        # Build the resident encoder using the same CPU arithmetic as the original
+        # local checkpoints, then upload the entire TP shard before serving.
+        resident_flex = False
+        if (
+            component_name == "text_encoder"
+            and not component_starts_on_cpu
+            and local_torch_device.type == "xpu"
+            and isinstance(quant_config, SerializedConvRotConfig)
+            and server_args.tp_size == 2
+        ):
+            from sglang.multimodal_gen.configs.pipeline_configs.qwen_image21 import (
+                QwenImage21PipelineConfig,
+            )
+            from sglang.kernels.ops.diffusion.rope.qwen_image21_b60 import is_flex_device
+
+            resident_flex = (
+                isinstance(server_args.pipeline_config, QwenImage21PipelineConfig)
+                and is_flex_device(local_torch_device)
+                and all(server_args.residency_mode(name) == "resident"
+                        for name in ("transformer", "text_encoder", "vae"))
+            )
+
+        if component_starts_on_cpu or resident_flex:
             model_device = torch.device("cpu")
         else:
             model_device = local_torch_device
@@ -792,5 +816,19 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
                     model = model.to("cpu")
             else:
                 model = model.to(local_torch_device)
+                if resident_flex:
+                    # Two Flex 170s expose about 14 GiB each. Keep driver memory
+                    # available for peer and convolution workspaces outside ATen.
+                    budget = 11664 * 1024**2
+                    total = torch.xpu.get_device_properties(local_torch_device).total_memory
+                    fraction = min(
+                        torch.xpu.get_per_process_memory_fraction(local_torch_device),
+                        budget / total,
+                    )
+                    torch.xpu.set_per_process_memory_fraction(fraction, local_torch_device)
+                    server_args._flex_full_resident_encoder = True
+                    logger.info("Flex TP2 keeps the entire ConvRot encoder on %s; "
+                                "allocator budget %.0f MiB", local_torch_device,
+                                total * fraction / 1024**2)
 
         return model

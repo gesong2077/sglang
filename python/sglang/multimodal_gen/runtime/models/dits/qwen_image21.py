@@ -75,8 +75,10 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 
 _is_cuda = current_platform.is_cuda()
 _is_xpu = current_platform.is_xpu()
+flex_bf16 = None
 if _is_xpu:
     from sglang.kernels.ops.diffusion.rope import qwen_image21_b60 as b60
+    from sglang.multimodal_gen.runtime.models.dits import qwen_image21_flex_bf16 as flex_bf16
     from sglang.srt.hardware_backend.xpu.quantization.moss_convrot import (
         rotate_and_pack,
     )
@@ -94,6 +96,7 @@ _FLEX_PADDED_DOWN = BitExactFusionGate(
     "Flex 170 padded BF16 MLP down", per_signature=True
 )
 _FLEX_PACKED_FA = BitExactFusionGate("Flex Qwen packed Flash Attention", per_signature=True)
+_FLEX_WIDE_FA = BitExactFusionGate("Flex wide BF16 QKV packed attention", per_signature=True)
 _FLEX_QKV = BitExactFusionGate("Flex 170 BF16 batch Q/K/V", per_signature=True)
 _XPU_QK = BitExactFusionGate("XPU Q/K RMSNorm + RoPE", per_signature=True)
 _B60_RESIDUAL = BitExactFusionGate("B60 BF16 gated residual")
@@ -349,7 +352,7 @@ def _flex_row_kwargs(module, residual, gate):
     # return a scratch buffer and overwrite the residual on its next call.
     if type(layer.quant_method) not in (
         UnquantizedLinearMethod, _FlexTP2DownMethod, _DiTConvRotMethod
-    ):
+    ) and not (flex_bf16 is not None and type(layer.quant_method) is flex_bf16.PackedOutput):
         return {}
     if any(
         part.training
@@ -629,6 +632,12 @@ class _FlexTP2DownMethod(UnquantizedLinearMethod):
 
     def apply(self, layer, x, bias=None):
         w = layer.weight
+        if w.shape == (4096, 6144) and w.stride() == (1, 4096):
+            if w.device.type == "xpu":
+                w.record_stream(torch.xpu.current_stream(w.device))
+            if x.shape != (1, 4096, 6144) or x.stride(-2) != 6160 or x.stride(-1) != 1:
+                w = w.contiguous()
+            return apply_unquantized_linear(x, w, bias)
         if (
             x.device.type == "xpu"
             and x.shape == (1, 4096, 6144)
@@ -764,7 +773,14 @@ class QwenImage21FeedForward(nn.Module):
     def _apply(self, fn, recurse=True):
         # .to() and CPU offload rebuild every parameter in its own storage;
         # re-share them once the weights are back on the GPU.
+        resident = hasattr(self, "_flex_bf16_pack")
+        if resident:
+            flex_bf16.retire(self, (self.gate_layer, self.proj), fn=fn)
         module = super()._apply(fn, recurse)
+        if resident:
+            self.out.weight.data = self.out.weight.contiguous()
+            if type(self.out.quant_method) is _FlexTP2DownMethod:
+                self.out.quant_method = UnquantizedLinearMethod()
         self.pack_gate_up_weights()
         self.pad_b60_down_weight()
         return module
@@ -773,6 +789,10 @@ class QwenImage21FeedForward(nn.Module):
         row_kwargs = (
             {"gated_residual": gated_residual} if gated_residual is not None else {}
         )
+        if _is_xpu and envs.SGLANG_DIFFUSION_FLEX_BF16_PERSISTENT:
+            hidden = flex_bf16.mlp_hidden(self, x, _FlexTP2ColumnMethod, _FlexTP2DownMethod)
+            if hidden is not None:
+                return self.out(hidden, **row_kwargs)[0]
         # Storage-identity checks cannot be traced; a compiled graph keeps the
         # separate projections.
         packed = None if torch.compiler.is_compiling() else self.packed_gate_up()
@@ -994,12 +1014,21 @@ class QwenImage21Attention(nn.Module):
         # .to() and CPU offload rebuild every parameter in its own storage;
         # re-share them once the weights are back on the GPU so the packed
         # projection survives the round trip (a no-op anywhere else).
+        if hasattr(self, "_flex_bf16_pack"):
+            flex_bf16.retire(self, (self.to_q, self.to_k, self.to_v), fn=fn)
+            flex_bf16.retire(self.to_out[0], (self.to_out[0],), fn=fn)
+            if isinstance(self.to_out[0].quant_method, flex_bf16.PackedOutput):
+                self.to_out[0].quant_method = UnquantizedLinearMethod()
         module = super()._apply(fn, recurse)
         self.pack_qkv_weights()
         return module
 
     def project_qkv(self, x):
         if _is_xpu:
+            if envs.SGLANG_DIFFUSION_FLEX_BF16_PERSISTENT:
+                projections = flex_bf16.qkv(self, x, _FlexTP2ColumnMethod)
+                if projections is not None:
+                    return projections
             layers = (self.to_q, self.to_k, self.to_v)
             batched = _FlexTP2ColumnMethod.for_image(x, layers)
             if batched is not None and not _FLEX_QKV.disabled:
@@ -1183,6 +1212,24 @@ class QwenImage21Attention(nn.Module):
         prefix_pad=None,
         qkv=None,
     ):
+        # Packed BF16 Q/K/V share one row. Their consumers require contiguous
+        # individual projections unless the measured strided kernel can run.
+        if _is_xpu and q.device.type == "xpu" and q.shape == (1, 4096, 16, 128) and q.stride(1) == 6144:
+            impl = getattr(self.target_attn, "attn_impl", None)
+            attention = getattr(impl, "qwen_packed_attention", None)
+            if (cache and prefix_pad is None and attention is not None and get_sp_world_size() == 1
+                    and self.norm_q.variance_epsilon == self.norm_k.variance_epsilon
+                    and b60.can_pack_wide_qkv(q, k, v, cache["key"], cache["value"],
+                                               self.norm_q.weight, self.norm_k.weight, rope)):
+                def packed():
+                    query, kv = b60.pack_wide_qkv(q, self.norm_q.weight, self.norm_k.weight, rope,
+                                                  cache["key"], cache["value"], self.norm_q.variance_epsilon)
+                    return attention(query[0], kv, impl.softmax_scale).unsqueeze(0)
+                def reference():
+                    return self.attend_sample(q.contiguous(), k.contiguous(), v.contiguous(), rope,
+                                              prefix, layout, cache, k_out, v_out, prefix_pad, qkv)[0]
+                return _FLEX_WIDE_FA.run(packed, reference, sig=q.device, logger=logger), None
+            q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
         has_prefix_cache = bool(cache)
         if cache and qkv is not None and qkv is cache.get("qkv"):
             # rows [0:P] of the kept buffer are this prefix's K/V: only Q and the target K change
@@ -1348,6 +1395,8 @@ class QwenImage21TransformerBlock(nn.Module):
         self.img_mlp = QwenImage21FeedForward(
             ac.hidden_size, ac.mlp_ratio, quant_config, f"{prefix}.img_mlp"
         )
+        self.attn._flex_bf16_layer = self.attn.to_out[0]._flex_bf16_layer = layer_id
+        self.img_mlp._flex_bf16_layer = layer_id
 
     def forward(
         self,
@@ -1549,6 +1598,16 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
         with self._changing_flex_token_weights():
             super().post_load_weights()
             for block in self.transformer_blocks:
+                if hasattr(block.attn, "_flex_bf16_pack"):
+                    attn = block.attn
+                    flex_bf16.retire(attn, (attn.to_q, attn.to_k, attn.to_v))
+                    flex_bf16.retire(attn.to_out[0], (attn.to_out[0],))
+                    if isinstance(attn.to_out[0].quant_method, flex_bf16.PackedOutput):
+                        attn.to_out[0].quant_method = UnquantizedLinearMethod()
+                if hasattr(block.img_mlp, "_flex_bf16_pack"):
+                    mlp = block.img_mlp
+                    flex_bf16.retire(mlp, (mlp.gate_layer, mlp.proj))
+                    mlp.out.weight.data = mlp.out.weight.contiguous()
                 block.attn.pack_qkv_weights()
                 block.img_mlp.pack_gate_up_weights()
                 block.img_mlp.pad_b60_down_weight()
@@ -1596,6 +1655,9 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
         rank = get_sp_parallel_rank()
         start, end = rank * local_len, (rank + 1) * local_len
         images = self.img_in(hidden_states[:, start:end])
+        bf16_state = None
+        if _is_xpu and envs.SGLANG_DIFFUSION_FLEX_BF16_PERSISTENT:
+            bf16_state = flex_bf16.begin(self, images, layouts, prefix_pad, sp)
         temb = self.time_text_embed((timestep.to(images.dtype) / 1000), images.dtype)
         modulation = self.prepare_modulation(temb)
         prefix_modulation = None
@@ -1647,6 +1709,8 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
                 prefix_pad,
                 **token_args,
             )
+        if bf16_state is not None:
+            flex_bf16.finish(bf16_state, images.device)
         output = self.proj_out(self.norm_out(images, temb))
         if sp > 1:
             output = sequence_model_parallel_all_gather(output, dim=1)

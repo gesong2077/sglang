@@ -98,16 +98,21 @@ def _qk_kernel(
 @triton.jit
 def _flex_qk_kernel(
     X, W, R, Y, N: tl.constexpr, H: tl.constexpr, EPS: tl.constexpr, ROWS: tl.constexpr,
-    V=None, PACK_IMAGE_KV: tl.constexpr = False,
+    V=None, PACK_IMAGE_KV: tl.constexpr = False, WIDE_QKV: tl.constexpr = False,
+    WK=None, Q=None,
 ):
     # Match ATen eight-lane, four-register accumulation without moving a full head
     # between lane layouts. The order of the loads here is significant for Intel IGC.
-    if PACK_IMAGE_KV:
+    if PACK_IMAGE_KV or WIDE_QKV:
         # Each program owns a 16-token tile for one head in the DPASW layout.
         rows = (tl.program_id(0) // H * ROWS + tl.arange(0, ROWS)) * H + tl.program_id(0) % H
     else:
         rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
-    offsets = rows[:, None] * 128 + tl.arange(0, 8)[None, :]
+    source = rows * 128
+    if WIDE_QKV:
+        is_key = tl.program_id(1) != 0
+        source = (rows // H) * 6144 + (rows % H) * 128 + is_key.to(tl.int32) * 2048
+    offsets = source[:, None] + tl.arange(0, 8)[None, :]
     total = tl.full((ROWS, 8), 0, tl.float32)
     for reg in tl.static_range(4):
         partial = tl.full((ROWS, 8), 0, tl.float32)
@@ -122,9 +127,15 @@ def _flex_qk_kernel(
     a, b = tl.split(tl.reshape(a + b, (ROWS, 2)))
     inv = tl.rsqrt((a + b) * (1.0 / 128) + EPS)
     col = tl.arange(0, 128)
-    off = rows[:, None] * 128 + col[None, :]
+    off = source[:, None] + col[None, :]
     x = tl.load(X + off, rows[:, None] < N, 0).to(tl.float32)
-    w = tl.load(W + col).to(tl.float32)
+    if WIDE_QKV:
+        if is_key:
+            w = tl.load(WK + col).to(tl.float32)
+        else:
+            w = tl.load(W + col).to(tl.float32)
+    else:
+        w = tl.load(W + col).to(tl.float32)
     rot = tl.load(R + (rows // H)[:, None] * 128 + col[None, :], rows[:, None] < N, 0)
     scaled = (x * inv[:, None]).to(tl.bfloat16).to(tl.float32)
     weighted = (scaled * w[None, :]).to(tl.bfloat16).to(tl.float32)
@@ -133,7 +144,17 @@ def _flex_qk_kernel(
     real = tl.fma(a, c, -b * d)
     imag = tl.fma(a, d, b * c)
     z = tl.reshape(tl.join(real, imag), (ROWS, 128))
-    if PACK_IMAGE_KV:
+    if WIDE_QKV:
+        if is_key:
+            key_offset, value_offset = _flex_packed_kv_offsets(
+                (rows // H + 32)[:, None], (rows % H)[:, None], col[None, :]
+            )
+            tl.store(Y + key_offset, z)
+            value = tl.load(X + off + 2048)
+            tl.store(Y + 4128 * H * 128 + tl.trans(value_offset), tl.trans(value))
+        else:
+            tl.store(Q + rows[:, None] * 128 + col[None, :], z)
+    elif PACK_IMAGE_KV:
         token = rows // H + 32
         key_offset, value_offset = _flex_packed_kv_offsets(token[:, None], (rows % H)[:, None], col[None, :])
         tl.store(Y + key_offset, z)
@@ -160,6 +181,37 @@ def _flex_pack_qwen_prefix(K, V, Y):
     key, value = _flex_packed_kv_offsets(offset // 2048, offset // 128 % 16, offset % 128)
     tl.store(Y + key, tl.load(K + offset))
     tl.store(Y + 4128 * 2048 + value, tl.load(V + offset))
+
+
+def can_pack_wide_qkv(q, k, v, kp, vp, wq, wk, rope):
+    if (q.device.type != "xpu" or not is_flex_device(q.device) or torch.is_grad_enabled()
+            or torch.compiler.is_compiling() or q.dtype != torch.bfloat16
+            or q.shape != (1, 4096, 16, 128) or q.stride()[1:] != (6144, 128, 1)):
+        return False
+    return (
+        all(t.shape == q.shape and t.device == q.device and t.dtype == q.dtype
+            and t.stride() == q.stride() and t.untyped_storage().data_ptr() == q.untyped_storage().data_ptr()
+            and t.storage_offset() == q.storage_offset() + offset for t, offset in ((k, 2048), (v, 4096)))
+        and all(w.shape == (128,) and w.dtype == q.dtype and w.device == q.device
+                and w.is_contiguous() for w in (wq, wk))
+        and rope.device == q.device and rope.shape == (4096, 64)
+        and rope.dtype == torch.complex64 and rope.is_contiguous()
+        and all(t.shape == (1, 32, 16, 128) and t.device == q.device and t.dtype == q.dtype
+                for t in (kp, vp))
+    )
+
+
+def pack_wide_qkv(q, wq, wk, rope, kp, vp, eps):
+    # Each token has adjacent 2048-element Q, K and V rows in the packed GEMM output.
+    query = q.new_empty(q.shape)
+    kv = q.new_empty(2, 258, 16, 2048)
+    with torch.xpu.device(q.device):
+        _flex_pack_qwen_prefix[(128,)](kp.contiguous(), vp.contiguous(), kv, num_warps=8)
+        _flex_qk_kernel[(2048, 2)](
+            q, wq, torch.view_as_real(rope), kv, 65536, 16, eps, 32,
+            WIDE_QKV=True, WK=wk, Q=query, num_warps=8, enable_fp_fusion=False,
+        )
+    return query, kv
 
 
 def can_pack_flex_qwen_kv(q, k, v, kp, vp, weight, rope):

@@ -408,7 +408,8 @@ class DecodingStage(PipelineStage):
             quality=batch.sampling_params.quality,
         )
         extra = getattr(batch, "extra", {})
-        if extra.get(FLEX_MLP_LAYOUTS_USED) and batch.latents.device.type == "xpu":
+        flex_resident = getattr(server_args, "_flex_full_resident_encoder", False)
+        if (extra.get(FLEX_MLP_LAYOUTS_USED) or flex_resident) and batch.latents.device.type == "xpu":
             # The denoising stage has dropped this request's packed weights.
             # Their cached segments can fragment the VAE workspace even on a
             # previously decoded shape, especially after mixing step counts.
@@ -494,4 +495,7 @@ class DecodingStage(PipelineStage):
         )
 
         extra.pop(FLEX_MLP_LAYOUTS_USED, None)
+        if flex_resident and batch.latents.device.type == "xpu":
+            with torch.xpu.device(batch.latents.device):
+                torch.xpu.empty_cache()
         return output_batch

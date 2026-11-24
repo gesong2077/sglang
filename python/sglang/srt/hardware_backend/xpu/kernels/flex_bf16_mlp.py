@@ -25,6 +25,14 @@ def _library():
     lib.flex_mlp_error.restype = ctypes.c_char_p
     lib.flex_mlp_create.argtypes = [ptr]
     lib.flex_mlp_create.restype = ptr
+    lib.flex_projection_create.argtypes = [
+        ptr,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_bool,
+    ]
+    lib.flex_projection_create.restype = ptr
+    lib.flex_mlp_unpack.argtypes = [ptr] * 4
     lib.flex_mlp_destroy.argtypes = [ptr]
     lib.flex_mlp_destroy.restype = None
     for query in (lib.flex_mlp_packed_bytes, lib.flex_mlp_scratch_bytes):
@@ -36,10 +44,10 @@ def _library():
 
 
 class _Plan:
-    def __init__(self, device):
+    def __init__(self, device, k, n):
         self.lib = _library()
-        self.handle = self.lib.flex_mlp_create(
-            torch.xpu.current_stream(device).sycl_queue
+        self.handle = self.lib.flex_projection_create(
+            torch.xpu.current_stream(device).sycl_queue, k, n, k == 2048
         )
         if not self.handle:
             raise RuntimeError(self.lib.flex_mlp_error().decode())
@@ -51,18 +59,41 @@ class _Plan:
             self.lib.flex_mlp_destroy(self.handle)
 
 
+def _plan(device, k=4096, n=12288):
+    return _geometry_plan(device, k, n)
+
+
 @lru_cache
-def _plan(device):
-    return _Plan(device)
+def _geometry_plan(device, k, n):
+    return _Plan(device, k, n)
 
 
 @torch.library.custom_op(
     "sglang::flex_bf16_gate_up", mutates_args=(), device_types="xpu"
 )
 def flex_bf16_gate_up(x: torch.Tensor, packed: torch.Tensor) -> torch.Tensor:
-    plan = _plan(x.device)
+    return _project(x, packed, 12288)
+
+
+@torch.library.custom_op(
+    "sglang::flex_bf16_projection", mutates_args=(), device_types="xpu"
+)
+def flex_bf16_projection(x: torch.Tensor, packed: torch.Tensor, n: int) -> torch.Tensor:
+    return _project(x, packed, n)
+
+
+@flex_bf16_projection.register_fake
+def _fake_projection(x, packed, n):
+    return x.new_empty(1, 4096, n)
+
+
+def _project(x, packed, n):
+    k = x.shape[-1]
+    if (k, n) not in ((4096, 12288), (4096, 6144), (2048, 4096)):
+        raise ValueError("unsupported Flex projection geometry")
+    plan = _plan(x.device, k, n)
     if (
-        x.shape != (1, 4096, 4096)
+        x.shape != (1, 4096, k)
         or x.dtype != torch.bfloat16
         or not x.is_contiguous()
         or packed.device != x.device
@@ -70,9 +101,9 @@ def flex_bf16_gate_up(x: torch.Tensor, packed: torch.Tensor) -> torch.Tensor:
         or not packed.is_contiguous()
         or packed.numel() != plan.packed_bytes
     ):
-        raise ValueError("invalid Flex gate/up activation or packed weight")
+        raise ValueError("invalid Flex projection activation or packed weight")
     stream = torch.xpu.current_stream(x.device)
-    output = x.new_empty(1, 4096, 12288)
+    output = x.new_empty(1, 4096, n)
     scratch = packed.new_empty(plan.scratch_bytes)
     status = plan.lib.flex_mlp_run(
         plan.handle,
@@ -137,22 +168,46 @@ def _cached_weight(source, parameters, name, size, materialize):
     return packed
 
 
-def _packed_weight(x, wide, gate, up):
-    def materialize(stream):
-        plan = _plan(x.device)
-        packed = torch.empty(plan.packed_bytes, device=x.device, dtype=torch.uint8)
-        if plan.lib.flex_mlp_pack(
-            plan.handle, stream.sycl_queue, wide.data_ptr(), packed.data_ptr()
-        ):
-            raise RuntimeError(plan.lib.flex_mlp_error().decode())
-        return packed
+def pack_weight(wide, k, n):
+    canonical_shape = (n, k) if k == 2048 else (k, n)
+    if (
+        wide.shape != canonical_shape
+        or wide.dtype != torch.bfloat16
+        or not wide.is_contiguous()
+    ):
+        raise ValueError("invalid canonical Flex projection weight")
+    plan = _plan(wide.device, k, n)
+    packed = wide.new_empty(plan.packed_bytes, dtype=torch.uint8)
+    stream = torch.xpu.current_stream(wide.device)
+    if plan.lib.flex_mlp_pack(
+        plan.handle, stream.sycl_queue, wide.data_ptr(), packed.data_ptr()
+    ):
+        raise RuntimeError(plan.lib.flex_mlp_error().decode())
+    wide.record_stream(stream)
+    return packed
 
+
+def unpack_gate_up(packed):
+    plan = _plan(packed.device)
+    if packed.numel() != plan.packed_bytes or packed.dtype != torch.uint8:
+        raise ValueError("invalid packed Flex gate/up weight")
+    output = packed.new_empty((12288, 4096), dtype=torch.bfloat16)
+    stream = torch.xpu.current_stream(packed.device)
+    if plan.lib.flex_mlp_unpack(
+        plan.handle, stream.sycl_queue, packed.data_ptr(), output.data_ptr()
+    ):
+        raise RuntimeError(plan.lib.flex_mlp_error().decode())
+    packed.record_stream(stream)
+    return output
+
+
+def _packed_weight(x, wide, gate, up):
     return _cached_weight(
         wide,
         (gate, up),
         "flex_bf16_gate_up",
         lambda: _plan(x.device).packed_bytes,
-        materialize,
+        lambda stream: pack_weight(wide, 4096, 12288),
     )
 
 
