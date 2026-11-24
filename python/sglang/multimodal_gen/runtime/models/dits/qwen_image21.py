@@ -52,6 +52,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitche
 )
 from sglang.multimodal_gen.runtime.layers.quantization.moss_w8a8 import (
     can_pack_flex_mlp_output,
+    can_pack_flex_modulation,
     prepare_convrot_input,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
@@ -77,6 +78,9 @@ if _is_xpu:
         rotate_and_pack,
     )
 
+_FLEX_MODULATION_PACK = BitExactFusionGate(
+    "Flex 170 BF16 modulation + ConvRot INT8 pack", per_signature=True
+)
 _FLEX_SWIGLU_PACK = BitExactFusionGate(
     "Flex 170 BF16 SwiGLU + ConvRot INT8 pack", per_signature=True
 )
@@ -324,6 +328,53 @@ def apply_modulation(x, norm, scale):
     if fused is not None:
         return _MODULATION_FUSION.accept_or_fallback(fused, out, logger=logger)
     return out
+
+
+def modulate_image_input(x, norm, scale, module):
+    """Pack the modulated image once for the input projections that share it."""
+    if (
+        _is_xpu
+        and not torch.compiler.is_compiling()
+        and not torch.is_grad_enabled()
+        and type(module) in (QwenImage21Attention, QwenImage21FeedForward)
+        and not module.training
+        and x.device.type == "xpu"
+        and x.shape == (1, 4096, 4096)
+        and x.dtype == torch.bfloat16
+        and scale.shape == (1, 1, 4096)
+        and scale.is_contiguous()
+        and scale.dtype == x.dtype
+        and scale.device == x.device
+        and b60.is_flex_device(x.device)
+        and not _FLEX_MODULATION_PACK.disabled
+        and "forward" not in module.__dict__
+        and not module._forward_pre_hooks
+        and not module._forward_hooks
+        and not nn.modules.module._global_forward_pre_hooks
+        and not nn.modules.module._global_forward_hooks
+    ):
+        if type(module) is QwenImage21Attention:
+            layers = (module.to_q, module.to_k, module.to_v)
+        else:
+            layers = (module.gate_layer, module.proj)
+        if can_pack_flex_modulation(layers, x.device):
+            hidden = norm(x)
+            if (
+                hidden.shape != x.shape
+                or hidden.dtype != x.dtype
+                or hidden.device != x.device
+                or not hidden.is_contiguous()
+            ):
+                return hidden * (1 + scale)
+            return _FLEX_MODULATION_PACK.run(
+                lambda: rotate_and_pack(hidden, 256, modulation=scale),
+                lambda: rotate_and_pack(hidden * (1 + scale), 256),
+                sig=x.device,
+                equal=lambda a, b: torch.equal(a.values, b.values)
+                and torch.equal(a.scales, b.scales),
+                logger=logger,
+            )
+    return apply_modulation(x, norm, scale)
 
 
 class QwenImage21ZeroCenterRMSNorm(nn.Module):
@@ -917,7 +968,7 @@ class QwenImage21Attention(nn.Module):
         """
         # Storage-identity checks and the one-shot verification cannot be traced;
         # a compiled graph keeps the plain projections instead of breaking here.
-        if torch.compiler.is_compiling():
+        if not _is_cuda or torch.compiler.is_compiling():
             return None
         layers = (self.to_q, self.to_k, self.to_v)
         packed = self.packed_qkv_weight()
@@ -962,7 +1013,8 @@ class QwenImage21Attention(nn.Module):
     def _project_kv_into_buffers(self, x, layouts, caches):
         """Project K/V straight into ``[1, P+S, H, D]`` buffers; ``None`` keeps the plain path."""
         if not (
-            x.shape[0] == 1
+            _is_cuda
+            and x.shape[0] == 1
             and len(layouts) == 1
             and get_sp_world_size() == 1
             and _KV_PROJECT_INTO_FUSION.can_attempt_once()
@@ -1167,7 +1219,7 @@ class QwenImage21TransformerBlock(nn.Module):
             for state, cache in zip(prefix_states, caches, strict=True)
         ]
         attention, prefix_attentions = self.attn(
-            apply_modulation(hidden_states, self.img_norm1, scale1),
+            modulate_image_input(hidden_states, self.img_norm1, scale1, self.attn),
             ropes,
             prefixes,
             layouts,
@@ -1177,7 +1229,7 @@ class QwenImage21TransformerBlock(nn.Module):
         hidden_states = apply_gated_residual(hidden_states, attention, gate1)
         hidden_states = apply_gated_residual(
             hidden_states,
-            self.img_mlp(apply_modulation(hidden_states, self.img_norm2, scale2)),
+            self.img_mlp(modulate_image_input(hidden_states, self.img_norm2, scale2, self.img_mlp)),
             gate2,
         )
         for state, attention in zip(prefix_states, prefix_attentions, strict=True):

@@ -96,7 +96,7 @@ def _can_pack_dit_input(x):
 
 def prepare_convrot_input(layers, x, layer_type=ColumnParallelLinear):
     """Share a packed activation across plain projections within one forward."""
-    if _can_pack_dit_input(x) and all(
+    if isinstance(x, torch.Tensor) and _can_pack_dit_input(x) and all(
         type(layer) is layer_type
         and isinstance(layer.quant_method, _DiTConvRotMethod)
         and layer.quant_method.group == layers[0].quant_method.group
@@ -107,6 +107,24 @@ def prepare_convrot_input(layers, x, layer_type=ColumnParallelLinear):
     ):
         return layers[0].quant_method.prepare_input(x)
     return x
+
+
+def can_pack_flex_modulation(layers, device):
+    return all(
+        type(layer) is ColumnParallelLinear
+        and type(layer.quant_method) is _DiTConvRotMethod
+        and layer.quant_method.fast_rotation
+        and layer.quant_method.group == 256
+        and layer.tp_size == 2
+        and not layer.gather_output
+        and layer.weight.device == device
+        and layer.bias is None
+        and not layer.training
+        and "forward" not in layer.__dict__
+        and not layer._forward_pre_hooks
+        and not layer._forward_hooks
+        for layer in layers
+    )
 
 
 def can_pack_flex_mlp_output(layer, gate):

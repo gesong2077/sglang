@@ -104,3 +104,17 @@ def test_xpu_norm_rope_matches_bf16_rounding():
     ) * sin.unsqueeze(2)
     actual = norm_finish_if_supported(x, weight, sin, cos, 24, rope=True)
     assert torch.equal(actual, expected.flatten(2))
+
+
+def test_modulated_convrot_pack_preserves_bf16_rounding():
+    from sglang.srt.hardware_backend.xpu.quantization.moss_convrot import rotate_and_pack
+
+    gen = torch.Generator(device="xpu").manual_seed(27)
+    x = torch.randn(64, 4096, dtype=torch.bfloat16, device="xpu", generator=gen)
+    scale = torch.randn(1, 4096, dtype=x.dtype, device=x.device, generator=gen)
+    x[0].zero_()
+    scale[0, ::2] = -1
+    fused = rotate_and_pack(x, 256, modulation=scale)
+    reference = rotate_and_pack(x * (1 + scale), 256)
+    assert torch.equal(fused.values, reference.values)
+    assert torch.equal(fused.scales.view(torch.int32), reference.scales.view(torch.int32))

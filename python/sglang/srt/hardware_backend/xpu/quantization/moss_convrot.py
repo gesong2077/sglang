@@ -81,6 +81,8 @@ def _rotate_pack_rows(
     VALUE=None,
     SILU_TABLE=None,
     SWIGLU: tl.constexpr = False,
+    MODULATION=None,
+    MODULATE: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     col = tl.arange(0, BLOCK)
@@ -93,6 +95,11 @@ def _rotate_pack_rows(
         gate = tl.load(SILU_TABLE + bits).to(tl.float32)
         value = tl.load(VALUE + offsets, col < WIDTH, 0).to(tl.float32)
         activation = (gate * value).to(tl.bfloat16)
+    if MODULATE:
+        # Match the two BF16 roundings in norm(x) * (1 + scale).
+        scale = tl.load(MODULATION + col, col < WIDTH, 0).to(tl.float32)
+        factor = (1.0 + scale).to(tl.bfloat16)
+        activation = (activation.to(tl.float32) * factor.to(tl.float32)).to(tl.bfloat16)
     x = activation.to(tl.float32)
     x = _regular_h4(x, BLOCK, 1)
     x = _regular_h4(x, BLOCK, 4)
@@ -110,7 +117,9 @@ def _rotate_pack_rows(
     tl.store(S + row, scale)
 
 
-def rotate_and_pack(x, group, *, swiglu_value=None, silu_table=None):
+def rotate_and_pack(
+    x, group, *, swiglu_value=None, silu_table=None, modulation=None
+):
     width = x.size(-1)
     rows = x.numel() // width
     values = torch.empty((rows, width), dtype=torch.int8, device=x.device)
@@ -129,6 +138,8 @@ def rotate_and_pack(x, group, *, swiglu_value=None, silu_table=None):
             VALUE=swiglu_value,
             SILU_TABLE=silu_table,
             SWIGLU=swiglu_value is not None,
+            MODULATION=modulation,
+            MODULATE=modulation is not None,
             num_warps=warps,
         )
     return W8A8Activation(values, scales, x.shape, x.dtype)
