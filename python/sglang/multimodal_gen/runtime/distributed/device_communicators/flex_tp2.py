@@ -151,20 +151,29 @@ class _RegisteredSum:
         # Both ranks finish every setup phase together, even when just one fails.
         errors = [None, None]
         reference = None
+        # Agree on the wire layout before allocating or importing the banks.
+        packed_export = getattr(self.library, "flex_tp2_peer_export_planes", None)
+        packed = [False, False]
+        dist.all_gather_object(
+            packed,
+            packed_export is not None and envs.SGLANG_DIFFUSION_FLEX_TP2_PACKED_GATED,
+            group=group,
+        )
         with ExitStack() as stack:
             location = [None]
             try:
                 if not envs.SGLANG_DIFFUSION_FLEX_TP2_PEER:
                     raise RuntimeError("disabled by configuration")
                 lib = self.library
-                lib.flex_tp2_peer_export.argtypes = [
+                export = packed_export if all(packed) else lib.flex_tp2_peer_export
+                export.argtypes = [
                     ctypes.c_void_p,
                     ctypes.POINTER(ctypes.c_int),
                 ]
                 lib.flex_tp2_peer_open.argtypes = [ctypes.c_void_p, ctypes.c_int]
                 lib.flex_tp2_peer_sum.argtypes = lib.flex_tp2_sum.argtypes
                 fd = ctypes.c_int(-1)
-                if lib.flex_tp2_peer_export(self.handle, ctypes.byref(fd)):
+                if export(self.handle, ctypes.byref(fd)):
                     raise RuntimeError(lib.flex_tp2_error().decode())
                 sock = stack.enter_context(
                     socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

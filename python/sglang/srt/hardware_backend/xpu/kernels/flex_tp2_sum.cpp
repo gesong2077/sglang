@@ -78,18 +78,65 @@ struct PeerInbox {
     }
 };
 
+// Lossless wire layout for the 4096 x 4096 BF16 residual. Sign and mantissa
+// use one byte. Neighbouring exponents often fit a 16-value interval, so one
+// nibble and the maximum exponent per 128 values recover the original bits.
+// Groups with broader ranges or special values also store their high nibbles.
+namespace es = sycl::ext::intel::esimd;
+constexpr size_t plane_elements = 4096 * 4096;
+constexpr size_t plane_groups = plane_elements / 128;
+
+void encode_peer_planes(sycl::queue& q, const uint16_t* input, uint8_t* dest, uint8_t* tags) {
+    q.parallel_for(sycl::range<1>(plane_groups), [=](sycl::id<1> id) SYCL_ESIMD_KERNEL {
+        const size_t offset = id[0] * 128;
+        const auto bits = es::block_load<uint16_t, 128>(input + offset);
+        es::simd<uint16_t, 128> exponents = (bits >> 7) & 255;
+        const auto high = es::hmax<uint16_t>(exponents);
+        const bool raw = high == 255 || high - es::hmin<uint16_t>(exponents) > 15;
+        auto store_nibbles = [](uint8_t* out, es::simd<uint16_t, 128> n) SYCL_ESIMD_FUNCTION {
+            es::simd<uint16_t, 64> pairs = (n.select<64, 2>(0).read() & 15)
+                | ((n.select<64, 2>(1).read() & 15) << 4);
+            es::block_store(out, es::convert<uint8_t>(pairs));
+        };
+        es::block_store(dest + offset, es::convert<uint8_t>((bits & 127) | ((bits >> 8) & 128)));
+        store_nibbles(dest + plane_elements + offset / 2, exponents);
+        if (raw) store_nibbles(dest + 3 * plane_elements / 2 + offset / 2, exponents >> 4);
+        tags[id[0]] = raw ? 255 : static_cast<uint8_t>(high);
+    });
+}
+
+ESIMD_INLINE es::simd<uint16_t, 64> decode_peer_plane(
+    const uint8_t* src, const uint8_t* tags, size_t offset) SYCL_ESIMD_FUNCTION {
+    auto unpack = [](const uint8_t* addr) SYCL_ESIMD_FUNCTION {
+        const auto n = es::block_load<uint8_t, 32>(addr);
+        es::simd<uint8_t, 64> out;
+        out.select<32, 2>(0) = n & 15;
+        out.select<32, 2>(1) = n >> 4;
+        return out;
+    };
+    const auto low = unpack(src + plane_elements + offset / 2);
+    const uint8_t tag = tags[offset / 128];
+    es::simd<uint8_t, 64> exponents;
+    if (tag == 255) exponents = (unpack(src + 3 * plane_elements / 2 + offset / 2) << 4) | low;
+    else exponents = tag - ((tag - low) & 15);
+    const auto sm = es::convert<uint16_t>(es::block_load<uint8_t, 64>(src + offset));
+    return ((sm & 128) << 8) | (es::convert<uint16_t>(exponents) << 7) | (sm & 127);
+}
+
 // Both operands reside in local VRAM after the posted peer write. Block
 // loads/stores let one SIMD invocation reduce a whole aligned cache line pair.
-template <bool Gated>
+template <bool Gated, bool Packed = false>
 sycl::event add_peer_blocks(sycl::queue& q, uint16_t* x, const uint16_t* other,
                             size_t count, bool truncate, const uint16_t* residual = nullptr,
-                            const uint16_t* gate = nullptr) {
+                            const uint16_t* gate = nullptr, const uint8_t* tags = nullptr) {
     namespace es = sycl::ext::intel::esimd;
     constexpr int width = 64;
     return q.parallel_for(sycl::range<1>(count / width), [=](sycl::id<1> id) SYCL_ESIMD_KERNEL {
         const size_t offset = id[0] * width;
         const auto a = es::block_load<uint16_t, width>(x + offset);
-        const auto b = es::block_load<uint16_t, width>(other + offset);
+        es::simd<uint16_t, width> b;
+        if constexpr (Packed) b = decode_peer_plane(reinterpret_cast<const uint8_t*>(other), tags, offset);
+        else b = es::block_load<uint16_t, width>(other + offset);
         es::simd<uint32_t, width> a_bits = es::convert<uint32_t>(a) << 16;
         es::simd<uint32_t, width> b_bits = es::convert<uint32_t>(b) << 16;
         es::simd<float, width> sum = a_bits.bit_cast_view<float>() + b_bits.bit_cast_view<float>();
@@ -179,6 +226,10 @@ struct Context {
         // Submitting the copy itself on q keeps writes produced after that consumer ordered.
         if (sequence && last_queue != q) consumer.wait_and_throw();
         q.memcpy(dest, source, bytes).wait_and_throw();
+        signal_peer();
+    }
+
+    void signal_peer() {
         ++sequence;
         __atomic_store_n(flags + 8 * rank, sequence, __ATOMIC_RELEASE);
         // An advance to generation g implies that our read of g-1 finished.
@@ -219,6 +270,22 @@ struct Context {
         if (direct && (!inbox || !inbox->remote || count != capacity))
             throw std::invalid_argument("invalid DMA-BUF sum geometry or peer mapping");
         auto* dest = direct ? inbox->remote + parity * capacity : bank + rank * capacity;
+        if (direct && residual && count == plane_elements && inbox->bytes > 4 * capacity) {
+            if (sequence && last_queue != q) consumer.wait_and_throw();
+            const size_t tag_offset = 4 * capacity + parity * plane_groups;
+            auto* tags = reinterpret_cast<uint8_t*>(peer);
+            encode_peer_planes(q, x, reinterpret_cast<uint8_t*>(dest), tags);
+            // The in-order queue completes both the direct peer writes and this
+            // last tag copy before either rank can consume the encoded bank.
+            q.memcpy(reinterpret_cast<uint8_t*>(inbox->remote) + tag_offset, tags, plane_groups)
+                .wait_and_throw();
+            signal_peer();
+            consumer = add_peer_blocks<true, true>(
+                q, x, inbox->local + parity * capacity, count, truncate, residual, gate,
+                reinterpret_cast<const uint8_t*>(inbox->local) + tag_offset);
+            last_queue = q;
+            return;
+        }
         publish(q, dest, x, count * sizeof(uint16_t));
         // Only the DMA engine accesses the registered mapping. A GPU compute
         // load from another process's imported mapping is not coherent on Flex.
@@ -277,14 +344,20 @@ extern "C" void flex_tp2_destroy(void* context) {
     delete static_cast<Context*>(context);
 }
 
-extern "C" int flex_tp2_peer_export(void* handle, int* fd) {
+static int export_inbox(void* handle, int* fd, size_t extra_bytes) {
     try {
         auto& context = *static_cast<Context*>(handle);
-        context.inbox = std::make_unique<PeerInbox>(context.owner, 4 * context.capacity);
+        context.inbox = std::make_unique<PeerInbox>(context.owner, 4 * context.capacity + extra_bytes);
         context.inbox->allocate();
         *fd = context.inbox->export_fd;
         return 0;
     } catch (const std::exception& exc) { last_error = exc.what(); return -1; }
+}
+extern "C" int flex_tp2_peer_export(void* handle, int* fd) {
+    return export_inbox(handle, fd, 0);
+}
+extern "C" int flex_tp2_peer_export_planes(void* handle, int* fd) {
+    return export_inbox(handle, fd, 2 * plane_groups);
 }
 extern "C" int flex_tp2_peer_open(void* handle, int fd) {
     try {
