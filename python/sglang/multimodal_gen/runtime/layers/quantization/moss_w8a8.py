@@ -120,6 +120,7 @@ def can_pack_flex_modulation(layers, device):
         and layer.weight.device == device
         and layer.bias is None
         and not layer.training
+        and layer._compiled_call_impl is None
         and "forward" not in layer.__dict__
         and not layer._forward_pre_hooks
         and not layer._forward_hooks

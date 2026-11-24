@@ -51,6 +51,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_comfy_kitche
     comfy_kitchen_swiglu_mlp,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.moss_w8a8 import (
+    _DiTConvRotMethod,
     can_pack_flex_mlp_output,
     can_pack_flex_modulation,
     prepare_convrot_input,
@@ -341,12 +342,16 @@ def _flex_row_kwargs(module, residual, gate):
         layer.tp_size == 2 and layer.reduce_results and layer.bias is None
     ):
         return {}
-    if isinstance(layer.quant_method, ConvRotInt8ComfyKitchenLinearMethod):
-        # The comfy_kitchen MLP packs all three projections into its own callable.
+    # Each verified method returns a fresh activation. A custom method may
+    # return a scratch buffer and overwrite the residual on its next call.
+    if type(layer.quant_method) not in (
+        UnquantizedLinearMethod, _FlexTP2DownMethod, _DiTConvRotMethod
+    ):
         return {}
     if any(
         part.training
         or "forward" in part.__dict__
+        or getattr(part, "_compiled_call_impl", None) is not None
         or part._forward_hooks
         or part._forward_pre_hooks
         for part in (module, layer)
@@ -391,6 +396,7 @@ def modulate_image_input(x, norm, scale, module):
         and scale.device == x.device
         and b60.is_flex_device(x.device)
         and not _FLEX_MODULATION_PACK.disabled
+        and module._compiled_call_impl is None
         and "forward" not in module.__dict__
         and not module._forward_pre_hooks
         and not module._forward_hooks

@@ -883,6 +883,44 @@ def test_registry_routes_local_checkpoint_and_preserves_legacy():
     )
 
 
+def test_flex_row_epilogue_preserves_observed_compiled_and_custom_paths(monkeypatch):
+    from sglang.multimodal_gen.runtime.models.dits import qwen_image21 as dit
+
+    # No allocations or inter-process groups are needed to verify eligibility.
+    module = dit.QwenImage21FeedForward.__new__(dit.QwenImage21FeedForward)
+    row = dit.RowParallelLinear.__new__(dit.RowParallelLinear)
+    torch.nn.Module.__init__(module)
+    torch.nn.Module.__init__(row)
+    module.out = row
+    module.eval()
+    row.tp_size = 2
+    row.reduce_results = True
+    row.bias = None
+    row.quant_method = UnquantizedLinearMethod()
+    row.tp_group = SimpleNamespace(flex_tp2=SimpleNamespace(gated_residual_ready=lambda: True))
+    residual = SimpleNamespace(shape=(1, 4096, 4096), device=torch.device("xpu"))
+    gate = object()
+    monkeypatch.setattr(dit, "_is_xpu", True)
+    monkeypatch.setattr(dit._B60_RESIDUAL, "verified", True)
+    monkeypatch.setattr(dit._B60_RESIDUAL, "disabled", False)
+    with torch.inference_mode():
+        assert dit._flex_row_kwargs(module, residual, gate)
+        for part in (module, row):
+            with part.register_forward_hook(lambda *_: None):
+                assert not dit._flex_row_kwargs(module, residual, gate)
+            with patch.object(part, "_compiled_call_impl", Mock()):
+                assert not dit._flex_row_kwargs(module, residual, gate)
+        with patch.object(torch.compiler, "is_compiling", return_value=True):
+            assert not dit._flex_row_kwargs(module, residual, gate)
+        # A subclass may return aliased scratch. Only audited allocating
+        # quantization methods can return the accumulated buffer as a residual.
+        class CustomMethod(UnquantizedLinearMethod):
+            pass
+
+        row.quant_method = CustomMethod()
+        assert not dit._flex_row_kwargs(module, residual, gate)
+
+
 def test_packed_qkv_weight_skips_offloaded_placeholders():
     # Layerwise offload swaps every weight for one shared 1-D placeholder; the
     # packing check runs from _apply and must not unpack it as [rows, cols].
