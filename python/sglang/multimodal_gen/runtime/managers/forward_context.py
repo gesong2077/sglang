@@ -15,6 +15,8 @@ if TYPE_CHECKING:
 # Req.extra key for what models keep for one denoising loop (Wan's text K/V): the denoising
 # stage drops it when the loop ends; the leading "_" keeps it out of request transfers
 DENOISING_LOOP_STATE = "_denoising_loop_state"
+# Only a boolean survives the denoising loop; the packed tensors are dropped separately.
+FLEX_MLP_LAYOUTS_USED = "_flex_mlp_layouts_used"
 
 
 @dataclass

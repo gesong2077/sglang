@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import VAELoader
+from sglang.multimodal_gen.runtime.managers.forward_context import FLEX_MLP_LAYOUTS_USED
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -126,6 +127,7 @@ class DecodingStage(PipelineStage):
         self.pipeline = weakref.ref(pipeline) if pipeline else None
         self.component_name = component_name
         self._compiled_vae_decode = ActiveTargetCompiledCallable()
+        self._flex_warm_decodes = weakref.WeakKeyDictionary()
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -406,6 +408,18 @@ class DecodingStage(PipelineStage):
             self.component_name,
             quality=batch.sampling_params.quality,
         )
+        warm_signatures = None
+        if getattr(batch, "extra", {}).pop(FLEX_MLP_LAYOUTS_USED, False):
+            device = batch.latents.device
+            if device.type == "xpu":
+                warm_signatures = self._flex_warm_decodes.setdefault(self.vae, set())
+                signature = (device, tuple(batch.latents.shape), vae_dtype)
+                if signature not in warm_signatures:
+                    # The denoising stage already dropped these packed weights.
+                    # Release inactive allocator segments so the first VAE decode
+                    # can allocate its larger workspaces without evicting to host.
+                    with torch.xpu.device(device):
+                        torch.xpu.empty_cache()
         stream = self._encode_while_decoding(batch, server_args)
         output_file_paths = None
         with self.use_declared_component(
@@ -485,4 +499,6 @@ class DecodingStage(PipelineStage):
             usage=batch.usage,
         )
 
+        if warm_signatures is not None:
+            warm_signatures.add(signature)
         return output_batch

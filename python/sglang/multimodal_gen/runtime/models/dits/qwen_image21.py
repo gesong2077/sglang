@@ -594,6 +594,7 @@ class _FlexTP2ColumnMethod(UnquantizedLinearMethod):
             and layer.bias is None
             and layer.weight.device == x.device
             and "forward" not in layer.__dict__
+            and layer._compiled_call_impl is None
             and not layer._forward_pre_hooks
             and not layer._forward_hooks
             for layer in layers
@@ -786,19 +787,25 @@ class QwenImage21FeedForward(nn.Module):
                         packed_gate_up,
                     )
 
-                    gate, up = packed_gate_up(
-                        x, wide, self.gate_layer.weight, self.proj.weight, logger
-                    ).chunk(2, dim=-1)
-                    pad = (
+                    can_pack = (
                         type(self.out) is RowParallelLinear
                         and type(self.out.quant_method) is _FlexTP2DownMethod
                         and not self.out.training
                         and "forward" not in self.out.__dict__
+                        and self.out._compiled_call_impl is None
                         and not self.out._forward_pre_hooks
                         and not self.out._forward_hooks
                         and not _FLEX_PADDED_DOWN.disabled
-                        and down_weight(self.out.weight) is not None
                     )
+                    if can_pack:
+                        projected = packed_gate_up(
+                            x, wide, self.gate_layer.weight, self.proj.weight, logger
+                        )
+                        pad = down_weight(self.out.weight) is not None
+                    else:
+                        projected = x @ wide
+                        pad = False
+                    gate, up = projected.chunk(2, dim=-1)
                     return b60.fused_pointwise(
                         gate,
                         up,

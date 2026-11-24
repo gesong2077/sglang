@@ -10,6 +10,7 @@ import torch
 from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     DENOISING_LOOP_STATE,
+    FLEX_MLP_LAYOUTS_USED,
     get_forward_context_or_none,
 )
 
@@ -128,6 +129,7 @@ def _cached_weight(source, parameters, name, size, materialize):
         ready = torch.xpu.Event()
         ready.record(stream)
         entry = cache[key] = (stamp, packed, stream, ready)
+        ctx.forward_batch.extra[FLEX_MLP_LAYOUTS_USED] = True
     _, packed, producer, ready = entry
     if producer != stream:
         stream.wait_event(ready)
