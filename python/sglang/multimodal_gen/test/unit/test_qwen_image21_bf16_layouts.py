@@ -8,6 +8,14 @@ import torch
 from torch import nn
 
 from sglang.multimodal_gen.runtime.models.dits import qwen_image21_flex_bf16 as layouts
+from sglang.srt.hardware_backend.xpu.quantization.w8a8_int8_kernels import W8A8Activation
+
+
+def test_bf16_path_skips_packed_convrot_input():
+    packed = W8A8Activation(torch.zeros(1, 8, dtype=torch.int8), torch.ones(1), (1, 8))
+    attention = SimpleNamespace(_flex_bf16_layer=0)
+    with torch.inference_mode():
+        assert layouts._active(attention, packed) is None
 
 
 def layer():

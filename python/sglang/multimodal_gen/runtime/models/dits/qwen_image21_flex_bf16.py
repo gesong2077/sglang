@@ -94,7 +94,8 @@ def finish(request_state, device):
 
 def _active(owner, x):
     if (
-        getattr(owner, "_flex_bf16_layer", _MAX_LAYERS) >= _MAX_LAYERS
+        not isinstance(x, torch.Tensor)
+        or getattr(owner, "_flex_bf16_layer", _MAX_LAYERS) >= _MAX_LAYERS
         or torch.compiler.is_compiling()
         or torch.is_grad_enabled()
         or x.device.type != "xpu"
