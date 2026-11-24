@@ -154,6 +154,9 @@ def _is_oom(error):
     )
 
 
+FLEX_RESIDENT_PEER_WINDOW = "qwen21_flex_resident_peer_window"
+
+
 def prepare_tokens(model, x, layouts, prefix_pad, sp):
     if (
         sp != 1
@@ -199,6 +202,10 @@ def prepare_tokens(model, x, layouts, prefix_pad, sp):
         - torch.xpu.memory_allocated(x.device)
     )
     needed = (2 << 30) if reuse else (5 << 30)
+    progressive = request.extra.get(FLEX_RESIDENT_PEER_WINDOW, False)
+    if progressive and not reuse:
+        # Each filled slab replaces the original shard before the next allocation.
+        needed = len(model.transformer_blocks) * (80 << 20) + (384 << 20)
     eligible = eligible and available >= needed
     vote = torch.tensor(
         [int(eligible) * (2 if reuse else 1), int(stamp is not None)],
@@ -225,7 +232,10 @@ def prepare_tokens(model, x, layouts, prefix_pad, sp):
                 _weight_stamp(model.transformer_blocks) if persistent else None,
             )
             if not state.copy_replicas(
-                model.transformer_blocks, group.cpu_group, x.device
+                model.transformer_blocks,
+                group.cpu_group,
+                x.device,
+                progressive=progressive,
             ):
                 loop[key] = None
                 return None
@@ -359,7 +369,39 @@ class TokenShards:
                 for layer, count in ((out, 2), (gate, 4), (down, 2))
             )
 
-    def copy_replicas(self, blocks, cpu_group, device):
+    @torch.inference_mode(False)
+    @torch.no_grad()
+    def copy_progressively(self, blocks, cpu_group, device):
+        self.stream = torch.xpu.current_stream(device)
+        for index, block in enumerate(blocks):
+            try:
+                self.allocate_slabs([block])
+                allocated = True
+            except torch.OutOfMemoryError:
+                allocated = False
+            if not _all_ready(allocated, cpu_group):
+                self.slabs.pop(block._layer_id, None)
+                self.ready = self.stream.record_event()
+                if not _all_ready(self.compact(blocks), cpu_group):
+                    raise RuntimeError(
+                        "Flex TP2 could not compact its resident weight slabs"
+                    )
+                return False
+            for (source, local), (_, peer) in zip(
+                self.slab_views(block, self.slabs[block._layer_id], self.rank),
+                self.slab_views(block, self.slabs[block._layer_id], 1 - self.rank),
+            ):
+                source.record_stream(self.stream)
+                local.copy_(source)
+                self.bridge.peer_exchange(local, out=peer)
+                source.data = local
+            if index % 4 == 3:
+                torch.xpu.empty_cache()
+        self.stamp = _weight_stamp(blocks)
+        self.ready = self.stream.record_event()
+        return True
+
+    def copy_replicas(self, blocks, cpu_group, device, *, progressive=False):
         native = False
         if self.stamp is not None:
             try:
@@ -370,7 +412,10 @@ class TokenShards:
                 native = supports_flex_token_pairs(device)
             except OSError:
                 pass
-        if _all_ready(native, cpu_group):
+        native = _all_ready(native, cpu_group)
+        if progressive:
+            return native and self.copy_progressively(blocks, cpu_group, device)
+        if native:
             try:
                 self.allocate_slabs(blocks)
                 allocated = True

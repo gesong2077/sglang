@@ -9,6 +9,7 @@ from transformers.utils import TransformersKwargs, is_torchdynamo_compiling
 
 from sglang.multimodal_gen.configs.models.encoders.qwen3vl import Qwen3VLConfig
 from sglang.multimodal_gen.runtime.distributed import (
+    get_tp_group,
     get_tp_world_size,
     model_parallel_is_initialized,
     tensor_model_parallel_all_gather,
@@ -24,6 +25,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.layers.quantization.moss_w8a8 import (
     ConvRotEmbedding,
+    FlexTP2ConvRotEmbedding,
     SerializedConvRotConfig,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
@@ -519,12 +521,16 @@ class Qwen3VLTextModel(nn.Module):
             isinstance(quant_config, SerializedConvRotConfig)
             and embedding_prefix in quant_config.groups
         ):
-            self.embed_tokens = ConvRotEmbedding(
+            args = (
                 config.vocab_size,
                 config.hidden_size,
                 quant_config.groups[embedding_prefix],
                 torch.get_default_dtype(),
             )
+            if getattr(config, "flex_shard_convrot_vocab", False):
+                self.embed_tokens = FlexTP2ConvRotEmbedding(*args, get_tp_group())
+            else:
+                self.embed_tokens = ConvRotEmbedding(*args)
         elif quant_config is not None and quant_config.quantizes_embedding(
             embedding_prefix
         ):
@@ -1149,13 +1155,23 @@ class Qwen3VLForConditionalGeneration(TextEncoder):
             isinstance(quant_config, SerializedConvRotConfig)
             and "lm_head" in quant_config.groups
         ):
-            self.lm_head = Qwen3VLQuantizedLinear(
-                config.text_config.hidden_size,
-                config.text_config.vocab_size,
-                bias=False,
-                quant_config=quant_config,
-                prefix="lm_head",
-            )
+            if getattr(config.text_config, "flex_shard_convrot_vocab", False):
+                self.lm_head = Qwen3VLColumnParallelLinear(
+                    config.text_config.hidden_size,
+                    config.text_config.vocab_size,
+                    bias=False,
+                    gather_output=True,
+                    quant_config=quant_config,
+                    prefix="lm_head",
+                )
+            else:
+                self.lm_head = Qwen3VLQuantizedLinear(
+                    config.text_config.hidden_size,
+                    config.text_config.vocab_size,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix="lm_head",
+                )
         else:
             self.lm_head = nn.Linear(
                 config.text_config.hidden_size,

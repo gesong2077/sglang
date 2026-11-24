@@ -4,6 +4,7 @@ import math
 import torch
 from PIL import Image
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.cache.conditioning import cached_encoder_call
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
@@ -276,6 +277,43 @@ def prepare_qwen21_mu(batch, server_args):
 
 
 class QwenImage21DenoisingStage(DenoisingStage):
+    def forward(self, batch, server_args):
+        dit_fraction = getattr(server_args, "_flex_resident_dit_fraction", None)
+        if (
+            dit_fraction is None
+            or not envs.SGLANG_DIFFUSION_FLEX_CONVROT_TOKEN_PARALLEL
+        ):
+            return super().forward(batch, server_args)
+
+        from sglang.multimodal_gen.runtime.models.dits.qwen_image21_flex_tokens import (
+            FLEX_RESIDENT_PEER_WINDOW,
+            _retire,
+        )
+
+        device = batch.latents.device
+        if device.type != "xpu":
+            return super().forward(batch, server_args)
+        original_fraction = torch.xpu.get_per_process_memory_fraction(device)
+        with torch.xpu.device(device):
+            torch.xpu.set_per_process_memory_fraction(dit_fraction, device)
+            try:
+                torch.xpu.empty_cache()
+                batch.extra[FLEX_RESIDENT_PEER_WINDOW] = True
+                return super().forward(batch, server_args)
+            finally:
+                batch.extra.pop(FLEX_RESIDENT_PEER_WINDOW, None)
+                try:
+                    state = getattr(self.transformer, "_flex_token_shards", None)
+                    if state is not None:
+                        state.wait_before_weight_change()
+                        if not _retire(self.transformer):
+                            raise RuntimeError(
+                                "Flex TP2 could not release peer copies before decoding"
+                            )
+                    torch.xpu.empty_cache()
+                finally:
+                    torch.xpu.set_per_process_memory_fraction(original_fraction, device)
+
     def _predict_noise(
         self,
         current_model,

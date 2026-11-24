@@ -1,6 +1,7 @@
 import os
 import re
 from collections.abc import Generator
+from copy import copy
 
 import torch
 import transformers
@@ -738,8 +739,14 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
             model_config.honor_cache_free_padding_mask = isinstance(
                 server_args.pipeline_config, LongCatImagePipelineConfig
             )
+            construction_config = model_config
+            if resident_flex and encoder_tp_group.world_size == 2:
+                construction_config = copy(model_config)
+                arch = construction_config.arch_config = copy(model_config.arch_config)
+                text = arch.text_config = copy(arch.text_config)
+                text.flex_shard_convrot_vocab = text.vocab_size % 2 == 0
             model = initialize_model(
-                model_cls, {"config": model_config}, param_dtype, model_device
+                model_cls, {"config": construction_config}, param_dtype, model_device
             )
 
             if not isinstance(model, EncoderTensorParallelMixin):
@@ -821,8 +828,12 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
                     # available for peer and convolution workspaces outside ATen.
                     budget = 11664 * 1024**2
                     total = torch.xpu.get_device_properties(local_torch_device).total_memory
+                    previous_fraction = torch.xpu.get_per_process_memory_fraction(local_torch_device)
+                    server_args._flex_resident_dit_fraction = min(
+                        previous_fraction, 12608 * 1024**2 / total
+                    )
                     fraction = min(
-                        torch.xpu.get_per_process_memory_fraction(local_torch_device),
+                        previous_fraction,
                         budget / total,
                     )
                     torch.xpu.set_per_process_memory_fraction(fraction, local_torch_device)

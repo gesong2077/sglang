@@ -109,3 +109,32 @@ def test_failed_apply_retires_partial_migration(shared):
     assert not hasattr(model, "_flex_token_shards") and not state.slabs
     assert block.weight.untyped_storage().nbytes() == block.weight.nbytes
     assert block.scale.untyped_storage().nbytes() == block.scale.nbytes
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_sharded_convrot_vocabulary(rank):
+    from sglang.multimodal_gen.runtime.layers.quantization.moss_w8a8 import (
+        ConvRotEmbedding,
+        FlexTP2ConvRotEmbedding,
+    )
+
+    ids = torch.tensor([[0, 1, 9, 15], [10, 7, 8, 6]])
+    original = ConvRotEmbedding(16, 4, 4, torch.bfloat16)
+    original.weight.data.copy_(torch.arange(64, dtype=torch.int8).reshape(16, 4))
+    original.weight_scale.data.copy_(torch.arange(1, 17).reshape(16, 1) / 32)
+    tp = Mock(world_size=2, rank_in_group=rank)
+    shard = FlexTP2ConvRotEmbedding(16, 4, 4, torch.bfloat16, tp)
+    for local, full in zip(shard.parameters(), original.parameters()):
+        local.weight_loader(local, full)
+        assert torch.equal(local, full.chunk(2)[rank])
+    halves = torch.stack([original(ids % 8 + 8 * i) for i in range(2)])
+
+    def gather(local, dim):
+        assert dim == 0 and torch.equal(local[0], halves[rank])
+        return halves
+
+    tp.all_gather.side_effect = gather
+    assert torch.equal(shard(ids), original(ids))
+    assert shard(ids[:, :0]).shape == (2, 0, 4)
+    with pytest.raises(IndexError):
+        shard(torch.tensor([16]))

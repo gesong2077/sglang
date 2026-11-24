@@ -206,6 +206,45 @@ class ConvRotEmbedding(nn.Module):
         return rotate(rows.float() * scale, self.group).to(self.output_dtype)
 
 
+class FlexTP2ConvRotEmbedding(ConvRotEmbedding):
+    """Keep each serialized vocabulary row on its owning Flex GPU."""
+
+    def __init__(self, rows, columns, group, dtype, tp_group):
+        if tp_group.world_size != 2 or rows % 2:
+            raise ValueError(
+                "Flex vocabulary sharding requires an even vocabulary and two ranks"
+            )
+        self.rows_per_rank = rows // 2
+        super().__init__(self.rows_per_rank, columns, group, dtype)
+        self.tp_group = tp_group
+        self.weight.weight_loader = self._load_shard
+        self.weight_scale.weight_loader = self._load_shard
+
+    def _load_shard(self, param, weight):
+        from sglang.multimodal_gen.runtime.loader.weight_utils import (
+            default_weight_loader,
+        )
+
+        if weight.shape[0] == 2 * self.rows_per_rank:
+            start = self.tp_group.rank_in_group * self.rows_per_rank
+            weight = weight.narrow(0, start, self.rows_per_rank)
+        default_weight_loader(param, weight)
+
+    def forward(self, ids):
+        if ids.numel() == 0:
+            return self.weight.new_empty(
+                (*ids.shape, self.weight.shape[1]), dtype=self.output_dtype
+            )
+        size = self.rows_per_rank
+        # Preserve embedding's out-of-range check and every bit of the owning row.
+        local_ids = torch.where(
+            (ids >= 0) & (ids < 2 * size), ids.remainder(size), size
+        )
+        local = super().forward(local_ids)
+        halves = self.tp_group.all_gather(local.unsqueeze(0).contiguous(), dim=0)
+        return torch.where((ids >= size).unsqueeze(-1), halves[1], halves[0])
+
+
 def install_moss_projections(model, config, *, text_only=False):
     if not isinstance(config, CompressedInt8Config):
         raise NotImplementedError(
