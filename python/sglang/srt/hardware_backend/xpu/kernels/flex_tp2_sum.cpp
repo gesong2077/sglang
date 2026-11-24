@@ -174,6 +174,36 @@ struct Context {
         release(driver, host);
     }
 
+    void publish(sycl::queue& q, void* dest, const void* source, size_t bytes) {
+        // Reuse a bank only after its previous consumer, including stream switches.
+        // Submitting the copy itself on q keeps writes produced after that consumer ordered.
+        if (sequence && last_queue != q) consumer.wait_and_throw();
+        q.memcpy(dest, source, bytes).wait_and_throw();
+        ++sequence;
+        __atomic_store_n(flags + 8 * rank, sequence, __ATOMIC_RELEASE);
+        // An advance to generation g implies that our read of g-1 finished.
+        // Waiting for the peer's g before returning therefore protects its
+        // read of g-1 from our overwrite two generations later.
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+        while (__atomic_load_n(flags + 8 * (1-rank), __ATOMIC_ACQUIRE) < sequence) {
+            for (int i = 0; i < 64; ++i) _mm_pause();
+            if (std::chrono::steady_clock::now() > deadline)
+                throw std::runtime_error("timed out waiting for peer TP2 DMA");
+            std::this_thread::yield();
+        }
+    }
+
+    void exchange(sycl::queue& q, const void* input, void* output, size_t bytes) {
+        if (!input || !output || !bytes || bytes > capacity * sizeof(uint16_t) ||
+            !inbox || !inbox->local || !inbox->remote || !q.is_in_order() ||
+            q.get_context() != owner.get_context() || q.get_device() != owner.get_device())
+            throw std::invalid_argument("unsupported Flex peer byte exchange");
+        const size_t offset = ((sequence + 1) & 1) * capacity;
+        publish(q, inbox->remote + offset, input, bytes);
+        consumer = q.memcpy(output, inbox->local + offset, bytes);
+        last_queue = q;
+    }
+
     void run(sycl::queue& q, uint16_t* x, size_t count, bool truncate, bool direct = false,
              const uint16_t* residual = nullptr, const uint16_t* gate = nullptr) {
         if (!count || count > capacity || !q.is_in_order() ||
@@ -189,22 +219,7 @@ struct Context {
         if (direct && (!inbox || !inbox->remote || count != capacity))
             throw std::invalid_argument("invalid DMA-BUF sum geometry or peer mapping");
         auto* dest = direct ? inbox->remote + parity * capacity : bank + rank * capacity;
-        // Reuse a bank only after its previous consumer, including stream switches.
-        // Submitting the copy itself on q keeps writes produced after that consumer ordered.
-        if (sequence && last_queue != q) consumer.wait_and_throw();
-        q.memcpy(dest, x, count * 2).wait_and_throw();
-        ++sequence;
-        __atomic_store_n(flags + 8 * rank, sequence, __ATOMIC_RELEASE);
-        // An advance to generation g implies that our read of g-1 finished.
-        // Waiting for the peer's g before returning therefore protects its
-        // read of g-1 from our overwrite two generations later.
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
-        while (__atomic_load_n(flags + 8 * (1-rank), __ATOMIC_ACQUIRE) < sequence) {
-            for (int i = 0; i < 64; ++i) _mm_pause();
-            if (std::chrono::steady_clock::now() > deadline)
-                throw std::runtime_error("timed out waiting for peer TP2 DMA");
-            std::this_thread::yield();
-        }
+        publish(q, dest, x, count * sizeof(uint16_t));
         // Only the DMA engine accesses the registered mapping. A GPU compute
         // load from another process's imported mapping is not coherent on Flex.
         auto* other = peer;
@@ -302,6 +317,40 @@ extern "C" int flex_tp2_peer_sum_gated(void* handle, void* queue, void* input,
             *static_cast<sycl::queue*>(queue), static_cast<uint16_t*>(input), count,
             truncate, true, static_cast<const uint16_t*>(residual),
             static_cast<const uint16_t*>(gate));
+        return 0;
+    } catch (const std::exception& exc) { last_error = exc.what(); return -1; }
+}
+
+extern "C" int flex_tp2_peer_exchange(void* handle, void* queue, const void* input,
+                                     void* output, size_t bytes) {
+    try {
+        if (!handle || !queue) throw std::invalid_argument("missing Flex coordinator or queue");
+        static_cast<Context*>(handle)->exchange(*static_cast<sycl::queue*>(queue), input, output, bytes);
+        return 0;
+    } catch (const std::exception& exc) { last_error = exc.what(); return -1; }
+}
+
+extern "C" int flex_tp2_local_update(void* handle, void* queue, uint16_t* first,
+                                    const uint16_t* second, const uint16_t* residual,
+                                    const uint16_t* gate, int truncate) {
+    try {
+        if (!handle || !queue || !first || !second || !residual || !gate)
+            throw std::invalid_argument("missing Flex local update argument");
+        auto& ctx = *static_cast<Context*>(handle);
+        auto& q = *static_cast<sycl::queue*>(queue);
+        const auto a = reinterpret_cast<uintptr_t>(first);
+        const auto b = reinterpret_cast<uintptr_t>(second);
+        const auto r = reinterpret_cast<uintptr_t>(residual);
+        const auto g = reinterpret_cast<uintptr_t>(gate);
+        constexpr size_t elements = 2048 * 4096;
+        constexpr size_t bytes = elements * sizeof(uint16_t);
+        if (!q.is_in_order() || q.get_context() != ctx.owner.get_context() ||
+            q.get_device() != ctx.owner.get_device() || ((a | b | r | g) % 128) ||
+            (a != b && a < b + bytes && b < a + bytes) ||
+            (a != r && a < r + bytes && r < a + bytes) ||
+            (a < g + 4096 * sizeof(uint16_t) && g < a + bytes))
+            throw std::invalid_argument("unsupported Flex local update queue, alignment or overlap");
+        add_peer_blocks<true>(q, first, second, elements, truncate, residual, gate);
         return 0;
     } catch (const std::exception& exc) { last_error = exc.what(); return -1; }
 }

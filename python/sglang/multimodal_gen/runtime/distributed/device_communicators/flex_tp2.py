@@ -19,6 +19,7 @@ from triton.language.extra import libdevice
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context_or_none,
+    set_forward_context,
 )
 
 logger = logging.getLogger(__name__)
@@ -102,8 +103,22 @@ class _RegisteredSum:
         self.gated_sum = getattr(self.library, "flex_tp2_peer_sum_gated", None)
         if self.gated_sum is not None:
             self.gated_sum.argtypes = [
-                *self.library.flex_tp2_sum.argtypes, pointer, pointer
+                *self.library.flex_tp2_sum.argtypes,
+                pointer,
+                pointer,
             ]
+        self.exchange = getattr(self.library, "flex_tp2_peer_exchange", None)
+        self.local_update = getattr(self.library, "flex_tp2_local_update", None)
+        if self.exchange is not None:
+            self.exchange.argtypes = [
+                pointer,
+                pointer,
+                pointer,
+                pointer,
+                ctypes.c_size_t,
+            ]
+        if self.local_update is not None:
+            self.local_update.argtypes = [pointer] * 6 + [ctypes.c_int]
         self.library.flex_tp2_destroy.argtypes = [pointer]
         self.library.flex_tp2_destroy.restype = None
         self.peer_ready = None
@@ -232,6 +247,7 @@ class FlexTP2Sum:
         self.device_group = coordinator.device_group
         self.device_index = torch.xpu.current_stream(coordinator.device).device_index
         self.round_toward_zero = {}
+        self._token_ops_ready = None
 
     @classmethod
     def try_create(cls, coordinator):
@@ -287,6 +303,121 @@ class FlexTP2Sum:
         # publication serialized if more than one local thread submits work.
         with self._submit_lock:
             return self._all_reduce(x)
+
+    def prepare_token_ops(self):
+        """Collectively verify two-rank token exchange before entering a sharded layer."""
+        if self._token_ops_ready is not None:
+            return self._token_ops_ready
+        with self._submit_lock:
+            if self._token_ops_ready is None:
+                reg = self.registered
+                available = (
+                    reg is not None
+                    and reg.exchange is not None
+                    and reg.local_update is not None
+                    and reg.peer_ready is not False
+                    and envs.SGLANG_DIFFUSION_FLEX_TP2_PEER
+                )
+                probe = None
+                if available and reg.peer_ready is None:
+                    try:
+                        # Distinct nonzero messages detect an unwritten incoming bank.
+                        probe = torch.full(
+                            (1, 4096, 4096),
+                            self.rank + 1,
+                            dtype=torch.bfloat16,
+                            device=torch.device("xpu", self.device_index),
+                        )
+                    except torch.OutOfMemoryError:
+                        available = False
+                peers = [None, None]
+                state = None
+                if available:
+                    state = "ready" if reg.peer_ready else "probe"
+                dist.all_gather_object(peers, state, group=self.group)
+                if peers == ["probe", "probe"]:
+                    with set_forward_context(0, None, is_denoising=True):
+                        self._all_reduce(probe)
+                self._token_ops_ready = (
+                    state is not None
+                    and peers == [state, state]
+                    and reg.peer_ready is True
+                )
+            return self._token_ops_ready
+
+    def peer_exchange(self, src, out=None):
+        """Exchange 1 byte to 32 MiB with the other rank, ordered on the caller's stream."""
+        if not self._token_ops_ready:
+            raise RuntimeError("call prepare_token_ops() on both ranks first")
+        if not (
+            src.device.type == "xpu"
+            and src.device.index == self.device_index
+            and src.is_contiguous()
+            and 0 < src.nbytes <= _MAX_BYTES
+        ):
+            raise ValueError(
+                "expected a contiguous rank-local payload of 1 byte to 32 MiB"
+            )
+        if out is None:
+            out = torch.empty_like(src)
+        if (
+            out.device != src.device
+            or not out.is_contiguous()
+            or out.nbytes != src.nbytes
+        ):
+            raise ValueError(
+                "peer output must match source device and byte count and be contiguous"
+            )
+        stream = torch.xpu.current_stream(src.device)
+        with self._submit_lock:
+            src.record_stream(stream)
+            out.record_stream(stream)
+            reg = self.registered
+            if reg.exchange(
+                reg.handle,
+                stream.sycl_queue,
+                src.data_ptr(),
+                out.data_ptr(),
+                src.nbytes,
+            ):
+                raise RuntimeError(reg.library.flex_tp2_error().decode())
+        return out
+
+    def local_update(self, first, second, residual, gate, truncate):
+        """Combine two BF16 TP partials for 2048 local tokens and write the gated update to first."""
+        if not self._token_ops_ready:
+            raise RuntimeError("call prepare_token_ops() on both ranks first")
+        if not (
+            first.shape == second.shape == residual.shape == (1, 2048, 4096)
+            and gate.shape == (1, 1, 4096)
+            and first.device.type == "xpu"
+            and first.device.index == self.device_index
+            and all(
+                t.device == first.device
+                and t.dtype == torch.bfloat16
+                and t.is_contiguous()
+                for t in (first, second, residual, gate)
+            )
+        ):
+            raise ValueError(
+                "expected rank-local contiguous BF16 token partials, residual and gate"
+            )
+        stream = torch.xpu.current_stream(first.device)
+        with self._submit_lock:
+            for tensor in (first, second, residual, gate):
+                tensor.record_stream(stream)
+            reg = self.registered
+            if reg.local_update(
+                reg.handle,
+                stream.sycl_queue,
+                first.data_ptr(),
+                second.data_ptr(),
+                residual.data_ptr(),
+                gate.data_ptr(),
+                truncate,
+            ):
+                raise RuntimeError(reg.library.flex_tp2_error().decode())
+        return first
 
     def gated_residual_ready(self):
         return (
