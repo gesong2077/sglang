@@ -21,6 +21,10 @@ _lib = C.CDLL(
 _lib.ow_error.restype = C.c_char_p
 _lib.ow_create.argtypes = [C.c_void_p] + [C.c_int] * 5
 _lib.ow_create.restype = C.c_void_p
+_pair_create = getattr(_lib, "ow_create_pair", None)
+if _pair_create is not None:
+    _pair_create.argtypes = [C.c_void_p] + [C.c_int] * 3
+    _pair_create.restype = C.c_void_p
 _lib.ow_scratch.argtypes = [C.c_void_p]
 _lib.ow_scratch.restype = C.c_size_t
 _lib.ow_run.argtypes = [C.c_void_p] * 8
@@ -29,11 +33,14 @@ _lib.ow_destroy.argtypes = [C.c_void_p]
 
 
 class _Plan:
-    def __init__(self, device, m, k, n, transposed):
+    def __init__(self, device, m, k, n, transposed, *, paired=False):
         queue = torch.xpu.current_stream(device).sycl_queue
         # Binary post-ops preserve (float(accum) * row_scale) * column_scale.
         self._destroy = _lib.ow_destroy
-        self.ptr = _lib.ow_create(queue, m, k, n, transposed, 2)
+        if paired:
+            self.ptr = _pair_create(queue, m, k, n)
+        else:
+            self.ptr = _lib.ow_create(queue, m, k, n, transposed, 2)
         if not self.ptr:
             raise RuntimeError(_lib.ow_error().decode())
         self.scratch_bytes = max(1, _lib.ow_scratch(self.ptr))
@@ -54,6 +61,67 @@ def _optional_plan(device, m, k, n, transposed):
         return _plan(device, m, k, n, transposed)
     except RuntimeError:
         return None
+
+
+@lru_cache(maxsize=8)
+def _pair_plan(device, k):
+    return _Plan(device, 2048, k, 4096, True, paired=True)
+
+
+def supports_flex_token_pairs(device):
+    if _pair_create is None:
+        return False
+    try:
+        for width in (2048, 6144):
+            _pair_plan(device.index, width)
+    except RuntimeError:
+        return False
+    return True
+
+
+@torch.library.custom_op(
+    "sglang::flex_token_row_pair", mutates_args=(), device_types="xpu"
+)
+def flex_token_row_pair(
+    q: torch.Tensor,
+    weight: torch.Tensor,
+    row_scale: torch.Tensor,
+    column_scale: torch.Tensor,
+) -> torch.Tensor:
+    b, m, k = q.shape
+    if (
+        b != 2
+        or m != 2048
+        or k not in (2048, 6144)
+        or weight.shape != (2, 4096, k)
+        or row_scale.shape != (2, m)
+        or column_scale.shape != (2, 4096)
+        or q.dtype != torch.int8
+        or weight.dtype != torch.int8
+        or row_scale.dtype != torch.float32
+        or column_scale.dtype != torch.float32
+        or not all(
+            t.is_contiguous() and t.device == q.device
+            for t in (q, weight, row_scale, column_scale)
+        )
+    ):
+        raise ValueError("invalid Flex TP2 channel weights or token scales")
+    plan = _pair_plan(q.device.index, k)
+    output = torch.empty((b, m, 4096), device=q.device, dtype=torch.bfloat16)
+    scratch = torch.empty(plan.scratch_bytes, device=q.device, dtype=torch.uint8)
+    stream = torch.xpu.current_stream(q.device)
+    if _lib.ow_run(
+        plan.ptr,
+        stream.sycl_queue,
+        q.data_ptr(),
+        weight.data_ptr(),
+        row_scale.data_ptr(),
+        column_scale.data_ptr(),
+        output.data_ptr(),
+        scratch.data_ptr(),
+    ):
+        raise RuntimeError(_lib.ow_error().decode())
+    return output
 
 
 def scaled_int8_mm(q, weight, row_scale, column_scale, *, optional=False):
@@ -85,7 +153,9 @@ def scaled_int8_mm(q, weight, row_scale, column_scale, *, optional=False):
     if _sequence_padding and n == 6656 and m >= 512:
         if _sequence_alignment < 2 or _sequence_alignment % 2:
             raise ValueError("Muse sequence alignment must be a positive even number")
-        rows = ((m + _sequence_alignment - 1) // _sequence_alignment) * _sequence_alignment
+        rows = (
+            (m + _sequence_alignment - 1) // _sequence_alignment
+        ) * _sequence_alignment
     storage = torch.empty((rows, n), dtype=torch.bfloat16, device=q.device)
     output = storage[:m] if rows != m else storage
     # Each call owns its outputs and scratch: no cross-layer or cross-stream alias.

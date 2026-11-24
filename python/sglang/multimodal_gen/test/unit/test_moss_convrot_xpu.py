@@ -107,7 +107,9 @@ def test_xpu_norm_rope_matches_bf16_rounding():
 
 
 def test_modulated_convrot_pack_preserves_bf16_rounding():
-    from sglang.srt.hardware_backend.xpu.quantization.moss_convrot import rotate_and_pack
+    from sglang.srt.hardware_backend.xpu.quantization.moss_convrot import (
+        rotate_and_pack,
+    )
 
     gen = torch.Generator(device="xpu").manual_seed(27)
     x = torch.randn(64, 4096, dtype=torch.bfloat16, device="xpu", generator=gen)
@@ -117,4 +119,53 @@ def test_modulated_convrot_pack_preserves_bf16_rounding():
     fused = rotate_and_pack(x, 256, modulation=scale)
     reference = rotate_and_pack(x * (1 + scale), 256)
     assert torch.equal(fused.values, reference.values)
-    assert torch.equal(fused.scales.view(torch.int32), reference.scales.view(torch.int32))
+    assert torch.equal(
+        fused.scales.view(torch.int32), reference.scales.view(torch.int32)
+    )
+
+
+def test_flex_batched_gate_up_and_row_projection_match_both_tp_shards():
+    from sglang.kernels.ops.diffusion.rope.qwen_image21_b60 import silu_table
+    from sglang.srt.hardware_backend.xpu.quantization.moss_convrot import (
+        pack_flex_gate_up_pair,
+        project_packed,
+        rotate_and_pack,
+    )
+    from sglang.srt.hardware_backend.xpu.quantization.onednn_w8a8 import (
+        flex_token_row_pair,
+        supports_flex_token_pairs,
+    )
+
+    device = torch.device("xpu", torch.xpu.current_device())
+    if torch.xpu.get_device_properties(
+        device
+    ).device_id != 0x56C0 or not supports_flex_token_pairs(device):
+        pytest.skip("requires Flex batched oneDNN projections")
+    generator = torch.Generator(device=device).manual_seed(6931)
+    wide = torch.randn(
+        (1, 2048, 24576), dtype=torch.bfloat16, device=device, generator=generator
+    )
+    wide[:, 0, :] = 0
+    table = silu_table(device)
+    codes, scales = pack_flex_gate_up_pair(wide, table)
+    weights = torch.randint(
+        -127, 128, (2, 4096, 6144), dtype=torch.int8, device=device, generator=generator
+    )
+    channels = torch.rand(
+        (2, 4096), dtype=torch.float32, device=device, generator=generator
+    )
+    combined = flex_token_row_pair(codes, weights, scales, channels)
+    parts = wide.chunk(4, dim=-1)
+    for rank in range(2):
+        tensor = rotate_and_pack(
+            parts[2 * rank].contiguous(),
+            256,
+            swiglu_value=parts[2 * rank + 1].contiguous(),
+            silu_table=table,
+        )
+        assert torch.equal(tensor.values, codes[rank])
+        assert torch.equal(
+            tensor.scales.view(torch.int32), scales[rank].view(torch.int32)
+        )
+        expected = project_packed(tensor, weights[rank], channels[rank])
+        assert torch.equal(combined[rank], expected[0])

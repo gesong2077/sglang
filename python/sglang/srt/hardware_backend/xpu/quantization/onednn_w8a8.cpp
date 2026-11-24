@@ -15,13 +15,22 @@ struct Plan {
   matmul::primitive_desc pd;
   matmul op;
   int mode;
-  Plan(sycl::queue &q, int m, int k, int n, bool bt, int md):
+  Plan(sycl::queue &q, int m, int k, int n, bool bt, int md, bool pair=false):
     eng(sycl_interop::make_engine(q.get_device(),q.get_context())),
     a({m,k},memory::data_type::s8,memory::dims{k,1}),
     b({k,n},memory::data_type::s8,bt?memory::dims{1,k}:memory::dims{n,1}),
     c({m,n},md==0?memory::data_type::s32:memory::data_type::bf16,memory::dims{n,1}),
     xs({m,1},memory::data_type::f32,memory::dims{1,1}),
     ws({1,n},memory::data_type::f32,memory::dims{n,1}),mode(md) {
+      if (pair) {
+        using dtype = memory::data_type;
+        using tag = memory::format_tag;
+        a = memory::desc({2,m,k},dtype::s8,tag::abc);
+        b = memory::desc({2,k,n},dtype::s8,tag::acb);
+        c = memory::desc({2,m,n},dtype::bf16,tag::abc);
+        xs = memory::desc({2,m,1},dtype::f32,tag::abc);
+        ws = memory::desc({2,1,n},dtype::f32,tag::abc);
+      }
       primitive_attr attr;
       attr.set_scratchpad_mode(scratchpad_mode::user);
       if(mode==1) {
@@ -41,6 +50,10 @@ extern "C" {
 const char* ow_error(){return last_error.c_str();}
 void* ow_create(void* queue,int m,int k,int n,int bt,int mode) {
   try{return new Plan(*static_cast<sycl::queue*>(queue),m,k,n,bt,mode);}
+  catch(const std::exception& e){last_error=e.what();return nullptr;}
+}
+void* ow_create_pair(void* queue,int m,int k,int n) {
+  try{return new Plan(*static_cast<sycl::queue*>(queue),m,k,n,true,2,true);}
   catch(const std::exception& e){last_error=e.what();return nullptr;}
 }
 size_t ow_scratch(void* ptr){return static_cast<Plan*>(ptr)->pd.scratchpad_desc().get_size();}

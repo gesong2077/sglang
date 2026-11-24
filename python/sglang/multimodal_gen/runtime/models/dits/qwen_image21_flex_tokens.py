@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.hardware_backend.xpu.quantization.moss_convrot import (
     _rotate_pack_rows,
+    pack_flex_gate_up_pair,
     project_packed,
     rotate_and_pack,
 )
@@ -78,7 +79,10 @@ def _eligible(blocks, device, group):
                 or type(layer.quant_method) is not _DiTConvRotMethod
             ):
                 return False
-            w, s = layer.weight, layer.weight_scale
+            w = getattr(layer, "weight", None)
+            s = getattr(layer, "weight_scale", None)
+            if w is None or s is None:
+                return False
             if not (
                 layer.tp_group is group
                 and layer.tp_size == 2
@@ -125,6 +129,31 @@ def _weight_stamp(blocks):
     return tuple(stamp)
 
 
+def _retire(model):
+    state = getattr(model, "_flex_token_shards", None)
+    if state is not None:
+        state.stamp = None
+        if not state.compact(model.transformer_blocks):
+            return False
+        model.__dict__.pop("_flex_token_shards", None)
+    return True
+
+
+def _all_ready(local, group):
+    vote = torch.tensor(int(local), dtype=torch.int32, device="cpu")
+    dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=group)
+    return bool(vote.item())
+
+
+def _is_oom(error):
+    text = str(error).lower().replace("_", " ")
+    return (
+        isinstance(error, torch.OutOfMemoryError)
+        or "out of memory" in text
+        or "out of device memory" in text
+    )
+
+
 def prepare_tokens(model, x, layouts, prefix_pad, sp):
     if (
         sp != 1
@@ -138,7 +167,7 @@ def prepare_tokens(model, x, layouts, prefix_pad, sp):
         or torch.compiler.is_compiling()
         or torch.is_grad_enabled()
     ):
-        model.__dict__.pop("_flex_token_shards", None)
+        _retire(model)
         return None
     ctx = get_forward_context_or_none()
     if ctx is None or not ctx.is_denoising or ctx.forward_batch is None:
@@ -164,9 +193,6 @@ def prepare_tokens(model, x, layouts, prefix_pad, sp):
         and previous.stamp == stamp
         and previous.ready is not None
     )
-    # Retire incomplete and stale copies before checking remaining memory.
-    if not reuse:
-        model._flex_token_shards = previous = None
     available = (
         torch.xpu.mem_get_info(x.device)[0]
         + torch.xpu.memory_reserved(x.device)
@@ -183,13 +209,21 @@ def prepare_tokens(model, x, layouts, prefix_pad, sp):
     mode, persistent = vote.tolist()
     state = None
     if mode != 2:
-        model._flex_token_shards = previous = None
+        compacted = _retire(model)
+        previous = None
+        if mode and not _all_ready(compacted, group.cpu_group):
+            loop[key] = None
+            return None
     if mode and bridge.prepare_token_ops():
         if mode == 2:
             state = previous
             state.on_stream(torch.xpu.current_stream(x.device))
         else:
-            state = TokenShards(bridge, model.num_layers, stamp if persistent else None)
+            state = TokenShards(
+                bridge,
+                model.num_layers,
+                _weight_stamp(model.transformer_blocks) if persistent else None,
+            )
             if not state.copy_replicas(
                 model.transformer_blocks, group.cpu_group, x.device
             ):
@@ -232,6 +266,7 @@ class TokenShards:
         self.rank = bridge.rank
         self.last_layer = layers - 1
         self.weights = {}
+        self.slabs = {}
         self.stamp = stamp
         self.ready = None
         self.stream = None
@@ -267,7 +302,113 @@ class TokenShards:
         self.bridge.peer_exchange(parts[self.rank], out=parts[1 - self.rank])
         return W8A8Activation(values, torch.cat(scales), (1, 2 * rows, width))
 
+    @staticmethod
+    def slab_views(block, slabs, rank):
+        out, gate, up, down = _replicated_layers(block)
+        for layer, pair, slot in (
+            (out, slabs[0], rank),
+            (gate, slabs[1], 2 * rank),
+            (up, slabs[1], 2 * rank + 1),
+            (down, slabs[2], rank),
+        ):
+            for original, storage in zip((layer.weight, layer.weight_scale), pair):
+                local = storage[slot]
+                if local.numel() == original.numel():
+                    local = local.view_as(original)
+                yield original, local
+
+    @torch.inference_mode(False)
+    @torch.no_grad()
+    def compact(self, blocks):
+        # Local Parameters are views of the same allocations as peer weights.
+        # Retire a block at a time so dropping the cache really gives memory back.
+        for index, block in enumerate(blocks):
+            key = getattr(block, "_layer_id", index)
+            slabs = self.slabs.get(key)
+            if slabs is None:
+                continue
+            storage_keys = {
+                (t.device, t.untyped_storage().data_ptr())
+                for pair in slabs
+                for t in pair
+            }
+            # A loader may already have replaced or removed an entire layer.
+            # Only copy current Parameters which still own part of the old slab.
+            for param in block.parameters():
+                if (
+                    param.device,
+                    param.untyped_storage().data_ptr(),
+                ) not in storage_keys:
+                    continue
+                stream = torch.xpu.current_stream(param.device)
+                if stream != self.stream:
+                    stream.wait_event(self.ready)
+                param.record_stream(stream)
+                try:
+                    param.data = param.clone()
+                except torch.OutOfMemoryError:
+                    return False
+            del self.slabs[key]
+        return True
+
+    @torch.inference_mode(False)
+    @torch.no_grad()
+    def allocate_slabs(self, blocks):
+        for block in blocks:
+            out, gate, _, down = _replicated_layers(block)
+            self.slabs[block._layer_id] = tuple(
+                (
+                    layer.weight.new_empty((count, *layer.weight.shape)),
+                    layer.weight_scale.new_empty((count, layer.weight_scale.numel())),
+                )
+                for layer, count in ((out, 2), (gate, 4), (down, 2))
+            )
+
     def copy_replicas(self, blocks, cpu_group, device):
+        native = False
+        if self.stamp is not None:
+            try:
+                from sglang.srt.hardware_backend.xpu.quantization.onednn_w8a8 import (
+                    supports_flex_token_pairs,
+                )
+
+                native = supports_flex_token_pairs(device)
+            except OSError:
+                pass
+        if _all_ready(native, cpu_group):
+            try:
+                self.allocate_slabs(blocks)
+                allocated = True
+            except torch.OutOfMemoryError:
+                allocated = False
+            if _all_ready(allocated, cpu_group):
+                self.stream = torch.xpu.current_stream(device)
+                for block in blocks:
+                    slabs = self.slabs[block._layer_id]
+                    for (source, local), (_, peer) in zip(
+                        self.slab_views(block, slabs, self.rank),
+                        self.slab_views(block, slabs, 1 - self.rank),
+                    ):
+                        source.record_stream(self.stream)
+                        local.copy_(source)
+                        self.bridge.peer_exchange(local, out=peer)
+                self.ready = self.stream.record_event()
+                for block in blocks:
+                    for param, local in self.slab_views(
+                        block, self.slabs[block._layer_id], self.rank
+                    ):
+                        param.data = local
+                self.stamp = _weight_stamp(blocks)
+                logger.info(
+                    "Flex TP2 rank %d installed canonical interleaved INT8 weights for %d blocks",
+                    self.rank,
+                    len(self.slabs),
+                )
+                return True
+            self.slabs.clear()
+        return self.copy_separate_replicas(blocks, cpu_group, device)
+
+    def copy_separate_replicas(self, blocks, cpu_group, device):
         # Allocate both ranks' destinations before the first weight collective.
         # An allocation failure on either card makes both ranks take the normal
         # tensor-parallel path without posting an unmatched peer exchange.
@@ -298,6 +439,10 @@ class TokenShards:
     def on_stream(self, stream):
         if stream != self.stream:
             stream.wait_event(self.ready)
+            for slabs in self.slabs.values():
+                for weight, scale in slabs:
+                    weight.record_stream(stream)
+                    scale.record_stream(stream)
             for block in self.weights.values():
                 for shards in block:
                     for weights in shards:
@@ -313,6 +458,82 @@ class TokenShards:
         inputs = self.ordered(owned, other)
         first, second = (project_packed(inp, *w) for inp, w in zip(inputs, weights))
         return self.bridge.local_update(first, second, x, gate, self.truncate)
+
+    @staticmethod
+    def row_pair(values, weights, scales, channel_scales):
+        from sglang.srt.hardware_backend.xpu.quantization.onednn_w8a8 import (
+            flex_token_row_pair,
+        )
+
+        return flex_token_row_pair(values, weights, scales, channel_scales).unbind(0)
+
+    def slab_attention_output(self, attention, x, gate, slab):
+        local, peer = self.ordered(*attention.flatten(2).chunk(2, dim=1))
+        rows, width = local.shape[-2:]
+        sbytes = rows * 4
+        half = rows * width + sbytes
+
+        def views(raw, rank):
+            if rank == 0:
+                return raw[sbytes:].view(torch.int8).view(rows, width), raw[
+                    :sbytes
+                ].view(torch.float32)
+            return raw[:-sbytes].view(torch.int8).view(rows, width), raw[-sbytes:].view(
+                torch.float32
+            )
+
+        def pack(inp, codes, scales):
+            with torch.xpu.device(inp.device):
+                _rotate_pack_rows[(rows,)](
+                    inp, codes, scales, width, 256, width, num_warps=4
+                )
+
+        send = torch.empty(half, device=x.device, dtype=torch.uint8)
+        pack(peer, *views(send, self.rank))
+        try:
+            raw = torch.empty(2 * half, device=x.device, dtype=torch.uint8)
+        except torch.OutOfMemoryError:
+            raw = None
+        if raw is not None:
+            parts = raw.view(2, half)
+            codes = raw[sbytes:-sbytes].view(torch.int8).view(2, rows, width)
+            scales = (
+                raw[:sbytes].view(torch.float32),
+                raw[-sbytes:].view(torch.float32),
+            )
+            pack(local, codes[self.rank], scales[self.rank])
+            self.bridge.peer_exchange(send, out=parts[1 - self.rank])
+            inputs = tuple(zip(codes.unbind(0), scales))
+            try:
+                a, b = self.row_pair(codes, slab[0], torch.stack(scales), slab[1])
+            except RuntimeError as exc:
+                if not _is_oom(exc):
+                    raise
+            else:
+                return self.bridge.local_update(
+                    a.view_as(x), b.view_as(x), x, gate, self.truncate
+                )
+        else:
+            owned = torch.empty_like(send)
+            own = views(owned, self.rank)
+            pack(local, *own)
+            received = self.bridge.peer_exchange(send)
+            inputs = self.ordered(own, views(received, 1 - self.rank))
+        # Both layouts used exactly one identical wire exchange. A single rank
+        # can retry the local GEMMs without posting a second collective.
+        a, b = (
+            project_packed(W8A8Activation(v, s, (1, rows, width)), w, ws)
+            for (v, s), w, ws in zip(inputs, *slab)
+        )
+        return self.bridge.local_update(
+            a.view_as(x), b.view_as(x), x, gate, self.truncate
+        )
+
+    def slab_mlp(self, packed, columns, down):
+        w, s = columns
+        wide = project_packed(packed, w.flatten(0, 1), s.flatten())
+        vals, scales = pack_flex_gate_up_pair(wide, b60.silu_table(w.device))
+        return self.row_pair(vals, down[0], scales, down[1])
 
     def block_forward(
         self, block, images, mod, prefix_state, prefix_mod, layout, rope, cache
@@ -335,17 +556,37 @@ class TokenShards:
         attention, prefix_out = block.attn.attend_sample(
             q, k, v, rope, prefix, layout, cache
         )
-        out, gates, ups, downs = self.weights[block._layer_id]
-        x = self.attention_output(attention, x, mod[1], out)
+        slabs = self.slabs.get(block._layer_id)
+        if slabs is None:
+            out, gates, ups, downs = self.weights[block._layer_id]
+            x = self.attention_output(attention, x, mod[1], out)
+        else:
+            out, columns, down = slabs
+            x = self.slab_attention_output(attention, x, mod[1], out)
         packed = rotate_and_pack(block.img_norm2(x), 256, modulation=mod[2])
-        partials = []
-        for gate, up, down in zip(gates, ups, downs):
-            g = project_packed(packed, *gate)
-            u = project_packed(packed, *up)
-            hidden = rotate_and_pack(
-                g, 256, swiglu_value=u, silu_table=b60.silu_table(x.device)
-            )
-            partials.append(project_packed(hidden, *down))
+        partials = None
+        if slabs is not None:
+            try:
+                partials = [
+                    part.view_as(x) for part in self.slab_mlp(packed, columns, down)
+                ]
+            except RuntimeError as exc:
+                if not _is_oom(exc):
+                    raise
+                # No collective runs inside the wide MLP. Retry from its input.
+                weights, scales = columns
+                gates = zip(weights[::2], scales[::2])
+                ups = zip(weights[1::2], scales[1::2])
+                downs = zip(*down)
+        if partials is None:
+            partials = []
+            for gate, up, down in zip(gates, ups, downs):
+                g = project_packed(packed, *gate)
+                u = project_packed(packed, *up)
+                hidden = rotate_and_pack(
+                    g, 256, swiglu_value=u, silu_table=b60.silu_table(x.device)
+                )
+                partials.append(project_packed(hidden, *down))
         x = self.bridge.local_update(*partials, x, mod[3], self.truncate)
         if prefix_out is not None:
             prefix = apply_gated_residual(

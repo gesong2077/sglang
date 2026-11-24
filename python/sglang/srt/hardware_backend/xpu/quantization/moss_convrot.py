@@ -83,17 +83,28 @@ def _rotate_pack_rows(
     SWIGLU: tl.constexpr = False,
     MODULATION=None,
     MODULATE: tl.constexpr = False,
+    PAIRED_GATE_UP: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     col = tl.arange(0, BLOCK)
     offsets = row.to(tl.int64) * WIDTH + col
-    activation = tl.load(X + offsets, col < WIDTH, 0)
+    source = offsets
+    scale_row = row
+    if PAIRED_GATE_UP:
+        part = tl.program_id(1)
+        source = row.to(tl.int64) * (4 * WIDTH) + part * (2 * WIDTH) + col
+        offsets += part * tl.num_programs(0) * WIDTH
+        scale_row += part * tl.num_programs(0)
+    activation = tl.load(X + source, col < WIDTH, 0)
     if SWIGLU:
         # The lookup table reproduces ATen's BF16 SiLU for every input bit pattern.
         # Preserve the following BF16 multiply rounding before the FP32 rotation.
         bits = activation.to(tl.uint16, bitcast=True).to(tl.int32)
         gate = tl.load(SILU_TABLE + bits).to(tl.float32)
-        value = tl.load(VALUE + offsets, col < WIDTH, 0).to(tl.float32)
+        if PAIRED_GATE_UP:
+            value = tl.load(X + source + WIDTH, col < WIDTH, 0).to(tl.float32)
+        else:
+            value = tl.load(VALUE + offsets, col < WIDTH, 0).to(tl.float32)
         activation = (gate * value).to(tl.bfloat16)
     if MODULATE:
         # Match the two BF16 roundings in norm(x) * (1 + scale).
@@ -114,12 +125,39 @@ def _rotate_pack_rows(
     peak = tl.max(bits, axis=0).to(tl.float32, bitcast=True)
     scale = tl.where(peak < 1e-10, 1e-10, peak) * (1.0 / 127)
     tl.store(Q + offsets, libdevice.rint(tl.div_rn(x, scale)).to(tl.int8), col < WIDTH)
-    tl.store(S + row, scale)
+    tl.store(S + scale_row, scale)
 
 
-def rotate_and_pack(
-    x, group, *, swiglu_value=None, silu_table=None, modulation=None
-):
+def pack_flex_gate_up_pair(wide, silu_table):
+    """Produce canonical [rank, token, channel] INT8 codes and row scales."""
+    if (
+        wide.shape != (1, 2048, 24576)
+        or not wide.is_contiguous()
+        or wide.dtype != torch.bfloat16
+    ):
+        raise ValueError(
+            "expected contiguous Flex TP2 gate/up projection [1, 2048, 24576]"
+        )
+    rows, width = 2048, 6144
+    values = torch.empty((2, rows, width), device=wide.device, dtype=torch.int8)
+    scales = torch.empty((2, rows), device=wide.device, dtype=torch.float32)
+    with torch.xpu.device(wide.device):
+        _rotate_pack_rows[(rows, 2)](
+            wide,
+            values,
+            scales,
+            width,
+            256,
+            8192,
+            SILU_TABLE=silu_table,
+            SWIGLU=True,
+            PAIRED_GATE_UP=True,
+            num_warps=16,
+        )
+    return values, scales
+
+
+def rotate_and_pack(x, group, *, swiglu_value=None, silu_table=None, modulation=None):
     width = x.size(-1)
     rows = x.numel() // width
     values = torch.empty((rows, width), dtype=torch.int8, device=x.device)
