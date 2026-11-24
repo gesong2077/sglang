@@ -97,11 +97,16 @@ def _qk_kernel(
 
 @triton.jit
 def _flex_qk_kernel(
-    X, W, R, Y, N: tl.constexpr, H: tl.constexpr, EPS: tl.constexpr, ROWS: tl.constexpr
+    X, W, R, Y, N: tl.constexpr, H: tl.constexpr, EPS: tl.constexpr, ROWS: tl.constexpr,
+    V=None, PACK_IMAGE_KV: tl.constexpr = False,
 ):
     # Match ATen eight-lane, four-register accumulation without moving a full head
     # between lane layouts. The order of the loads here is significant for Intel IGC.
-    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    if PACK_IMAGE_KV:
+        # Each program owns a 16-token tile for one head in the DPASW layout.
+        rows = (tl.program_id(0) // H * ROWS + tl.arange(0, ROWS)) * H + tl.program_id(0) % H
+    else:
+        rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
     offsets = rows[:, None] * 128 + tl.arange(0, 8)[None, :]
     total = tl.full((ROWS, 8), 0, tl.float32)
     for reg in tl.static_range(4):
@@ -128,7 +133,61 @@ def _flex_qk_kernel(
     real = tl.fma(a, c, -b * d)
     imag = tl.fma(a, d, b * c)
     z = tl.reshape(tl.join(real, imag), (ROWS, 128))
-    tl.store(Y + off, z, rows[:, None] < N)
+    if PACK_IMAGE_KV:
+        token = rows // H + 32
+        key_offset, value_offset = _flex_packed_kv_offsets(token[:, None], (rows % H)[:, None], col[None, :])
+        tl.store(Y + key_offset, z)
+        value = tl.load(V + off)
+        tl.store(Y + 4128 * H * 128 + tl.trans(value_offset), tl.trans(value))
+    else:
+        tl.store(Y + off, z, rows[:, None] < N)
+
+
+@triton.jit
+def _flex_packed_kv_offsets(token, head, col):
+    # Inverse of paired_kv_layout in sgl-kernel-xpu. Adjacent DPASW threads
+    # consume separate halves of K and V, with the key and value tiles transposed.
+    tile = (token // 16 * 16 + head) * 2048
+    pos = token % 16
+    key = tile + pos % 8 // 4 * 128 + pos // 8 * 64 + pos % 4 * 16 + col // 16 * 256 + col % 16
+    value = tile + pos + col // 16 * 256 + col % 8 // 4 * 128 + col % 16 // 8 * 64 + col % 4 * 16
+    return key, value
+
+
+@triton.jit
+def _flex_pack_qwen_prefix(K, V, Y):
+    offset = tl.program_id(0) * 512 + tl.arange(0, 512)
+    key, value = _flex_packed_kv_offsets(offset // 2048, offset // 128 % 16, offset % 128)
+    tl.store(Y + key, tl.load(K + offset))
+    tl.store(Y + 4128 * 2048 + value, tl.load(V + offset))
+
+
+def can_pack_flex_qwen_kv(q, k, v, kp, vp, weight, rope):
+    return (
+        q.shape == (1, 4096, 16, 128)
+        and q.dtype == torch.bfloat16
+        and q.is_contiguous()
+        and k.shape == q.shape
+        and k.device == q.device
+        and can_fuse_qk(k, weight, rope)
+        and is_flex_device(q.device)
+        and v.shape == q.shape
+        and v.dtype == q.dtype
+        and v.device == q.device
+        and v.is_contiguous()
+        and all(t.shape == (1, 32, 16, 128) and t.dtype == q.dtype and t.device == q.device for t in (kp, vp))
+    )
+
+
+def pack_flex_qwen_kv(k, v, kp, vp, weight, rope, eps):
+    packed = k.new_empty(2, 258, 16, 2048)
+    with torch.xpu.device(k.device):
+        _flex_pack_qwen_prefix[(128,)](kp.contiguous(), vp.contiguous(), packed, num_warps=8)
+        _flex_qk_kernel[(4096,)](
+            k, weight, torch.view_as_real(rope), packed, 65536, 16, eps, 16, v, True,
+            num_warps=8, enable_fp_fusion=False,
+        )
+    return packed
 
 
 def qk_norm_rope(x, weight, rope, eps):

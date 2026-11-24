@@ -91,6 +91,7 @@ _FLEX_GATE_UP = BitExactFusionGate(
 _FLEX_PADDED_DOWN = BitExactFusionGate(
     "Flex 170 padded BF16 MLP down", per_signature=True
 )
+_FLEX_PACKED_FA = BitExactFusionGate("Flex Qwen packed Flash Attention", per_signature=True)
 _FLEX_QKV = BitExactFusionGate("Flex 170 BF16 batch Q/K/V", per_signature=True)
 _XPU_QK = BitExactFusionGate("XPU Q/K RMSNorm + RoPE", per_signature=True)
 _B60_RESIDUAL = BitExactFusionGate("B60 BF16 gated residual")
@@ -1180,6 +1181,7 @@ class QwenImage21Attention(nn.Module):
         prefix_pad=None,
         qkv=None,
     ):
+        has_prefix_cache = bool(cache)
         if cache and qkv is not None and qkv is cache.get("qkv"):
             # rows [0:P] of the kept buffer are this prefix's K/V: only Q and the target K change
             rows = cache["key"].shape[1]
@@ -1228,6 +1230,31 @@ class QwenImage21Attention(nn.Module):
                     cache.update(qkv=qkv, key=k_out[:, :rows], value=v_out[:, :rows])
                 return self.attend_target(*cuda_packed, prefix_pad), prefix_output
         q = apply_qk_norm_rope(q, self.norm_q, rope)
+        if (
+            _is_xpu
+            and q.device.type == "xpu"
+            and has_prefix_cache
+            and prefix_pad is None
+            and get_sp_world_size() == 1
+            and not _FLEX_PACKED_FA.disabled
+        ):
+            impl = getattr(self.target_attn, "attn_impl", None)
+            attention = getattr(impl, "qwen_packed_attention", None)
+            if attention is not None and b60.can_pack_flex_qwen_kv(
+                q, k, v, kp, vp, self.norm_k.weight, rope
+            ):
+                def packed_attention():
+                    kv = b60.pack_flex_qwen_kv(
+                        k, v, kp, vp, self.norm_k.weight, rope, self.norm_k.variance_epsilon
+                    )
+                    return attention(q[0], kv, impl.softmax_scale).unsqueeze(0)
+
+                def ordinary_attention():
+                    key = apply_qk_norm_rope(k, self.norm_k, rope)
+                    return self.target_attn.forward_with_replicated_kv_prefix(q, kp, vp, key, v)
+
+                out = _FLEX_PACKED_FA.run(packed_attention, ordinary_attention, sig=q.device, logger=logger)
+                return out, prefix_output
         packed = None
         if (
             get_sp_world_size() == 1

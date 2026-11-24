@@ -100,6 +100,7 @@ class XPUAttentionImpl(AttentionImpl):
         self.head_size = head_size
         self.causal = causal
         self.softmax_scale = softmax_scale
+        self.qwen_packed_attention = None if causal else getattr(_xpu_fa, "hpg_flash_qwen_packed", None)
 
     def forward(
         self,
