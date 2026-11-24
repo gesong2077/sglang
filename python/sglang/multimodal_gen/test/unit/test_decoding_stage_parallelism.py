@@ -1,10 +1,12 @@
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 import torch.nn as nn
 
+from sglang.multimodal_gen.runtime.managers.forward_context import FLEX_MLP_LAYOUTS_USED
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
 )
@@ -20,6 +22,40 @@ class FakeVAE(nn.Module):
 
 
 class TestDecodingStageParallelism(unittest.TestCase):
+    def test_flex_layouts_are_released_for_each_request_before_decode(self):
+        stage = Mock(spec=DecodingStage, component_name="vae", vae=FakeVAE())
+        stage._encode_while_decoding.return_value = None
+        stage.use_declared_component.return_value = nullcontext(stage.vae)
+        stage.decode.return_value = torch.zeros(1, 3, 4, 4)
+        args = Mock(component_precisions={"vae": "bf16"})
+        device = torch.device("xpu:1")
+        batch = Mock(
+            extra={},
+            latents=SimpleNamespace(device=device, shape=(1, 64, 1, 64, 64)),
+            sampling_params=SimpleNamespace(quality="exact"),
+            return_trajectory_decoded=False,
+        )
+        with (
+            patch.object(torch.xpu, "device", return_value=nullcontext()) as select,
+            patch.object(torch.xpu, "empty_cache") as release,
+        ):
+            for used, expected in [(True, 1), (True, 2), (False, 2)]:
+                if used:
+                    batch.extra[FLEX_MLP_LAYOUTS_USED] = True
+                DecodingStage.forward(stage, batch, args)
+                self.assertEqual(release.call_count, expected)
+                self.assertNotIn(FLEX_MLP_LAYOUTS_USED, batch.extra)
+            select.assert_called_with(device)
+            batch.extra[FLEX_MLP_LAYOUTS_USED] = True
+            stage.decode.side_effect = RuntimeError("decode failed")
+            with self.assertRaisesRegex(RuntimeError, "decode failed"):
+                DecodingStage.forward(stage, batch, args)
+            self.assertTrue(batch.extra[FLEX_MLP_LAYOUTS_USED])
+            stage.decode.side_effect = None
+            DecodingStage.forward(stage, batch, args)
+            self.assertEqual(release.call_count, 4)
+            self.assertNotIn(FLEX_MLP_LAYOUTS_USED, batch.extra)
+
     def test_component_use_honors_decode_precision_override(self):
         stage = DecodingStage(FakeVAE())
         server_args = SimpleNamespace(
