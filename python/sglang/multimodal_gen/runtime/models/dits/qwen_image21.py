@@ -317,6 +317,47 @@ def apply_gated_residual(x, update, gate):
     return residual_gate_add(x, update, gate)
 
 
+def _flex_row_kwargs(module, residual, gate):
+    """Only pass the epilogue through unwrapped inference modules without observers."""
+    if (
+        not _is_xpu
+        or not _B60_RESIDUAL.verified
+        or _B60_RESIDUAL.disabled
+        or torch.compiler.is_compiling()
+        or torch.is_grad_enabled()
+        or residual.device.type != "xpu"
+        or residual.shape != (1, 4096, 4096)
+        or nn.modules.module._global_forward_pre_hooks
+        or nn.modules.module._global_forward_hooks
+    ):
+        return {}
+    if type(module) is QwenImage21Attention:
+        layer = module.to_out[0]
+    elif type(module) is QwenImage21FeedForward:
+        layer = module.out
+    else:
+        return {}
+    if type(layer) is not RowParallelLinear or not (
+        layer.tp_size == 2 and layer.reduce_results and layer.bias is None
+    ):
+        return {}
+    if isinstance(layer.quant_method, ConvRotInt8ComfyKitchenLinearMethod):
+        # The comfy_kitchen MLP packs all three projections into its own callable.
+        return {}
+    if any(
+        part.training
+        or "forward" in part.__dict__
+        or part._forward_hooks
+        or part._forward_pre_hooks
+        for part in (module, layer)
+    ):
+        return {}
+    flex = getattr(layer.tp_group, "flex_tp2", None)
+    if flex is None or not flex.gated_residual_ready():
+        return {}
+    return {"gated_residual": (residual, gate, apply_gated_residual)}
+
+
 def apply_modulation(x, norm, scale):
     fused = None
     if (
@@ -718,7 +759,10 @@ class QwenImage21FeedForward(nn.Module):
         self.pad_b60_down_weight()
         return module
 
-    def forward(self, x):
+    def forward(self, x, *, gated_residual=None):
+        row_kwargs = (
+            {"gated_residual": gated_residual} if gated_residual is not None else {}
+        )
         # Storage-identity checks cannot be traced; a compiled graph keeps the
         # separate projections.
         packed = None if torch.compiler.is_compiling() else self.packed_gate_up()
@@ -762,7 +806,7 @@ class QwenImage21FeedForward(nn.Module):
                     sig=x.device,
                     logger=logger,
                 )
-                return self.out(hidden)[0]
+                return self.out(hidden, **row_kwargs)[0]
             x = prepare_convrot_input((self.gate_layer, self.proj), x)
         gate, value = self.gate_layer(x)[0], self.proj(x)[0]
         if _is_xpu and b60.can_fuse_pair(gate, value):
@@ -780,7 +824,7 @@ class QwenImage21FeedForward(nn.Module):
                     and torch.equal(a.scales, b.scales),
                     logger=logger,
                 )
-                return self.out(hidden)[0]
+                return self.out(hidden, **row_kwargs)[0]
             # Write the activation in the measured BF16 TP2 down-GEMM layout.
             # Both leading dimensions then avoid a 12 KiB row stride.
             pad = (
@@ -797,7 +841,7 @@ class QwenImage21FeedForward(nn.Module):
                 lambda: nn.functional.silu(gate) * value,
                 logger=logger,
             )
-            return self.out(hidden)[0]
+            return self.out(hidden, **row_kwargs)[0]
         fused = None
         if (
             _is_cuda
@@ -806,11 +850,11 @@ class QwenImage21FeedForward(nn.Module):
         ):
             fused = fused_silu_mul_bitexact(gate, value)
             if _SILU_MUL_FUSION.verified:
-                return self.out(fused)[0]
+                return self.out(fused, **row_kwargs)[0]
         hidden = nn.functional.silu(gate) * value
         if fused is not None:
             hidden = _SILU_MUL_FUSION.accept_or_fallback(fused, hidden, logger=logger)
-        return self.out(hidden)[0]
+        return self.out(hidden, **row_kwargs)[0]
 
 
 class QwenImage21Attention(nn.Module):
@@ -1208,7 +1252,9 @@ class QwenImage21Attention(nn.Module):
                 )
         return out, prefix_output
 
-    def forward(self, x, ropes, prefixes, layouts, caches, prefix_pad):
+    def forward(
+        self, x, ropes, prefixes, layouts, caches, prefix_pad, *, gated_residual=None
+    ):
         # batch target projections while retaining each sample's unpadded prefix
         packed = self._project_qkv_packed(x, layouts, caches)
         qkv = None
@@ -1239,7 +1285,11 @@ class QwenImage21Attention(nn.Module):
             )
             outputs.append(out)
             prefix_outputs.append(prefix_out)
-        return self.to_out[0](cat_outputs(outputs).flatten(2))[0], prefix_outputs
+        row_kwargs = (
+            {"gated_residual": gated_residual} if gated_residual is not None else {}
+        )
+        output = self.to_out[0](cat_outputs(outputs).flatten(2), **row_kwargs)[0]
+        return output, prefix_outputs
 
 
 class QwenImage21TransformerBlock(nn.Module):
@@ -1280,6 +1330,7 @@ class QwenImage21TransformerBlock(nn.Module):
             else None
             for state, cache in zip(prefix_states, caches, strict=True)
         ]
+        row_kwargs = _flex_row_kwargs(self.attn, hidden_states, gate1)
         attention, prefix_attentions = self.attn(
             modulate_image_input(hidden_states, self.img_norm1, scale1, self.attn),
             ropes,
@@ -1287,12 +1338,18 @@ class QwenImage21TransformerBlock(nn.Module):
             layouts,
             caches,
             prefix_pad,
+            **row_kwargs,
         )
-        hidden_states = apply_gated_residual(hidden_states, attention, gate1)
-        hidden_states = apply_gated_residual(
-            hidden_states,
-            self.img_mlp(modulate_image_input(hidden_states, self.img_norm2, scale2, self.img_mlp)),
-            gate2,
+        hidden_states = (
+            attention if row_kwargs else apply_gated_residual(hidden_states, attention, gate1)
+        )
+        row_kwargs = _flex_row_kwargs(self.img_mlp, hidden_states, gate2)
+        mlp_input = modulate_image_input(
+            hidden_states, self.img_norm2, scale2, self.img_mlp
+        )
+        update = self.img_mlp(mlp_input, **row_kwargs)
+        hidden_states = (
+            update if row_kwargs else apply_gated_residual(hidden_states, update, gate2)
         )
         for state, attention in zip(prefix_states, prefix_attentions, strict=True):
             if attention is not None:

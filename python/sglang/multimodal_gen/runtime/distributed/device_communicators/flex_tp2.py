@@ -98,6 +98,12 @@ class _RegisteredSum:
             ctypes.c_size_t,
             ctypes.c_int,
         ]
+        # Older bridges retain the ordinary peer collective.
+        self.gated_sum = getattr(self.library, "flex_tp2_peer_sum_gated", None)
+        if self.gated_sum is not None:
+            self.gated_sum.argtypes = [
+                *self.library.flex_tp2_sum.argtypes, pointer, pointer
+            ]
         self.library.flex_tp2_destroy.argtypes = [pointer]
         self.library.flex_tp2_destroy.restype = None
         self.peer_ready = None
@@ -191,10 +197,17 @@ class _RegisteredSum:
             return None
         return reference
 
-    def all_reduce(self, x, truncate, *, peer=False):
+    def all_reduce(self, x, truncate, *, peer=False, gated_residual=None):
         stream = torch.xpu.current_stream(x.device)
         run = self.library.flex_tp2_peer_sum if peer else self.library.flex_tp2_sum
-        if run(self.handle, stream.sycl_queue, x.data_ptr(), x.numel(), truncate):
+        args = (self.handle, stream.sycl_queue, x.data_ptr(), x.numel(), truncate)
+        if gated_residual is not None:
+            residual, gate = gated_residual
+            run = self.gated_sum
+            args += (residual.data_ptr(), gate.data_ptr())
+            residual.record_stream(stream)
+            gate.record_stream(stream)
+        if run(*args):
             # A collective has started. Retrying locally could double-add or
             # leave the other rank waiting for the wrong generation.
             raise RuntimeError(self.library.flex_tp2_error().decode())
@@ -275,6 +288,38 @@ class FlexTP2Sum:
         with self._submit_lock:
             return self._all_reduce(x)
 
+    def gated_residual_ready(self):
+        return (
+            self.registered is not None
+            and self.registered.peer_ready is True
+            and self.registered.gated_sum is not None
+        )
+
+    def try_gated_residual(self, x, residual, gate):
+        """Complete one verified 32 MiB peer exchange and its local gated update."""
+        if not (
+            self.gated_residual_ready()
+            and self.supports(x)
+            and x.shape == residual.shape == (1, 4096, 4096)
+            and gate.shape == (1, 1, 4096)
+            and residual.device == gate.device == x.device
+            and residual.dtype == gate.dtype == x.dtype
+            and residual.is_contiguous()
+            and gate.is_contiguous()
+            and (x.data_ptr() | residual.data_ptr() | gate.data_ptr()) % 128 == 0
+        ):
+            return None
+        ctx = get_forward_context_or_none()
+        if ctx is None or not ctx.is_denoising:
+            return None
+        with self._submit_lock:
+            return self.registered.all_reduce(
+                x,
+                self.round_toward_zero[x.numel()],
+                peer=True,
+                gated_residual=(residual, gate),
+            )
+
     def _all_reduce(self, x):
         # oneCCL can either truncate or round BF16 depending on its selected
         # transport. Probe the actual size once so switching does not change it.
@@ -315,7 +360,7 @@ class FlexTP2Sum:
                             )
                     return x
             return self.registered.all_reduce(
-                x, truncate, peer=direct and self.registered.peer_ready
+                x, truncate, peer=direct and self.registered.peer_ready is True
             )
         rows = self.staging[:, : x.numel()]
         rows[self.rank].view_as(x).copy_(x)

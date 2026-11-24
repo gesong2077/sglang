@@ -1293,7 +1293,9 @@ class RowParallelLinear(LinearBase):
 
         param.load_row_parallel_weight(loaded_weight=loaded_weight)
 
-    def forward(self, input_) -> tuple[torch.Tensor, Parameter | None]:
+    def forward(
+        self, input_, *, gated_residual=None
+    ) -> tuple[torch.Tensor, Parameter | None]:
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1309,15 +1311,24 @@ class RowParallelLinear(LinearBase):
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+        output_bias = self.bias if self.skip_bias_add else None
         if self.reduce_results and self.tp_size > 1:
+            if gated_residual is not None:
+                flex = getattr(self.tp_group, "flex_tp2", None)
+                if flex is not None:
+                    residual, gate, _ = gated_residual
+                    output = flex.try_gated_residual(output_parallel, residual, gate)
+                    if output is not None:
+                        return output, output_bias
             output = tensor_model_parallel_all_reduce(
                 output_parallel, tp_group=self.tp_group
             )
         else:
             output = output_parallel
 
-        output_bias = self.bias if self.skip_bias_add else None
-
+        if gated_residual is not None:
+            residual, gate, apply_residual = gated_residual
+            output = apply_residual(residual, output, gate)
         return output, output_bias
 
     def extra_repr(self) -> str:

@@ -143,6 +143,74 @@ def test_peer_sum_preserves_bf16_bits(flex_tp2_group):
             assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
+def test_flex_gated_peer_sum(flex_tp2_group):
+    """Compare both epilogues bitwise, including stream switches and intervening sums."""
+    from sglang.kernels.ops.diffusion.rope.qwen_image21_b60 import fused_pointwise
+    from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+
+    group, device = flex_tp2_group
+    reducer = group.flex_tp2
+    if reducer is None or reducer.registered is None:
+        pytest.skip("requires the registered DMA bridge on both ranks")
+    shape = (1, 4096, 4096)
+    a = torch.randn(shape, dtype=torch.bfloat16, device=device)
+    residual = torch.randn_like(a)
+    gate = torch.randn(1, 1, 4096, dtype=a.dtype, device=device).tanh()
+    with set_forward_context(0, None, is_denoising=True):
+        group.all_reduce(a.clone())
+        if not reducer.gated_residual_ready():
+            pytest.skip("requires the gated peer epilogue on both ranks")
+
+        x = torch.empty_like(a)
+        scratch = torch.empty_like(a[0])
+        initial = torch.xpu.current_stream(device)
+        streams = [initial, torch.xpu.Stream(device), initial]
+        torch.xpu.synchronize(device)
+        register = reducer.registered
+        for stream in streams:
+            with torch.xpu.stream(stream):
+                # Mix registered-host and direct peer generations. The native
+                # copy must follow the GEMM and the writer on the caller stream.
+                for truncate in (True, False):
+                    reference = a.clone()
+                    register.all_reduce(reference, truncate, peer=False)
+                    expected = fused_pointwise(residual, reference, gate)
+                    x.fill_(float("nan"))
+                    torch.mm(a[0], a[0], out=scratch)
+                    x.copy_(a)
+                    register.all_reduce(
+                        x, truncate, peer=True, gated_residual=(residual, gate)
+                    )
+                    assert torch.equal(x.view(torch.int16), expected.view(torch.int16))
+
+        # Cross the payload, gate and residual NaN payloads, infinities, signed
+        # zeros and subnormal boundary. Both BF16 operations must round separately.
+        codes = torch.tensor(
+            [0, 1, 0x7F, 0x80, 0x3F80, 0x7F7F, 0x7F80, 0x7F81, 0x7FC1, 0x7FFF],
+            dtype=torch.int32, device=device,
+        )
+        codes = torch.cat([codes, codes | 0x8000]).to(torch.int16)
+        n = codes.numel()
+        rows = torch.arange(4096, device=device)
+        cols = torch.arange(4096, device=device)
+        local_code = rows // n if group.rank_in_group == 0 else rows
+        a.view(torch.int16).copy_(codes[local_code % n].view(1, -1, 1))
+        residual.view(torch.int16).copy_(codes[(cols // n) % n].view(1, 1, -1))
+        gate.view(torch.int16).copy_(codes[cols % n].view(1, 1, -1))
+        for truncate in (True, False):
+            expected = a.clone()
+            register.all_reduce(expected, truncate, peer=True)
+            expected = fused_pointwise(residual, expected, gate)
+            actual = a.clone()
+            register.all_reduce(
+                actual, truncate, peer=True, gated_residual=(residual, gate)
+            )
+            assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+        offset = torch.empty(a.numel() + 1, device=device, dtype=a.dtype)[1:].view(shape)
+        assert reducer.try_gated_residual(offset, residual, gate) is None
+
+
 def _peer_setup_worker(rank, rendezvous):
     """Exercise the real Unix descriptor exchange and asymmetric failures on CPU."""
     import ctypes

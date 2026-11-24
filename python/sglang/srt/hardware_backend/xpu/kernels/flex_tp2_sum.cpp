@@ -80,8 +80,10 @@ struct PeerInbox {
 
 // Both operands reside in local VRAM after the posted peer write. Block
 // loads/stores let one SIMD invocation reduce a whole aligned cache line pair.
+template <bool Gated>
 sycl::event add_peer_blocks(sycl::queue& q, uint16_t* x, const uint16_t* other,
-                           size_t count, bool truncate) {
+                            size_t count, bool truncate, const uint16_t* residual = nullptr,
+                            const uint16_t* gate = nullptr) {
     namespace es = sycl::ext::intel::esimd;
     constexpr int width = 64;
     return q.parallel_for(sycl::range<1>(count / width), [=](sycl::id<1> id) SYCL_ESIMD_KERNEL {
@@ -104,7 +106,28 @@ sycl::event add_peer_blocks(sycl::queue& q, uint16_t* x, const uint16_t* other,
             result.merge(sign, zero);
         }
         if (!truncate) result += 0x7fffU + ((result >> 16) & 1U);
-        es::block_store(x + offset, es::convert<uint16_t>(result >> 16));
+        es::simd<uint16_t, width> reduced = es::convert<uint16_t>(result >> 16);
+        if constexpr (Gated) {
+            auto as_f32 = [](es::simd<uint16_t, width> bits) SYCL_ESIMD_FUNCTION {
+                es::simd<uint32_t, width> wide = es::convert<uint32_t>(bits) << 16;
+                return es::simd<float, width>(wide.template bit_cast_view<float>());
+            };
+            auto round_bf16 = [](es::simd<float, width> value) SYCL_ESIMD_FUNCTION {
+                es::simd<uint32_t, width> bits = value.template bit_cast_view<uint32_t>();
+                // Triton preserves the quiet NaN payload in the high 16 bits.
+                bits += 0x7fffU + ((bits >> 16) & 1U);
+                return es::convert<uint16_t>(bits >> 16);
+            };
+            const auto gate_bits = es::block_load<uint16_t, width>(gate + offset % 4096);
+            const auto residual_bits = es::block_load<uint16_t, width>(residual + offset);
+            es::simd<float, width> product = as_f32(reduced) * as_f32(gate_bits);
+            auto update_product = round_bf16(product);
+            // Triton multiplies update * gate with the update as the first NaN source.
+            update_product.merge(reduced, (reduced & 0x7fffU) > 0x7f80U);
+            es::simd<float, width> out = as_f32(residual_bits) + as_f32(update_product);
+            reduced = round_bf16(out);
+        }
+        es::block_store(x + offset, reduced);
     });
 }
 
@@ -151,7 +174,8 @@ struct Context {
         release(driver, host);
     }
 
-    void run(sycl::queue& q, uint16_t* x, size_t count, bool truncate, bool direct = false) {
+    void run(sycl::queue& q, uint16_t* x, size_t count, bool truncate, bool direct = false,
+             const uint16_t* residual = nullptr, const uint16_t* gate = nullptr) {
         if (!count || count > capacity || !q.is_in_order() ||
             q.get_device() != owner.get_device() || q.get_context() != owner.get_context())
             throw std::invalid_argument("unsupported queue or payload");
@@ -191,7 +215,9 @@ struct Context {
         }
         if (direct && count == 16 * 1024 * 1024 &&
             (reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(other)) % 128 == 0) {
-            consumer = add_peer_blocks(q, x, other, count, truncate);
+            consumer = residual
+                ? add_peer_blocks<true>(q, x, other, count, truncate, residual, gate)
+                : add_peer_blocks<false>(q, x, other, count, truncate);
             last_queue = q;
             return;
         }
@@ -259,6 +285,23 @@ extern "C" int flex_tp2_peer_sum(void* handle, void* queue, void* input, size_t 
     try {
         static_cast<Context*>(handle)->run(*static_cast<sycl::queue*>(queue),
                                            static_cast<uint16_t*>(input),count,truncate,true);
+        return 0;
+    } catch (const std::exception& exc) { last_error = exc.what(); return -1; }
+}
+
+extern "C" int flex_tp2_peer_sum_gated(void* handle, void* queue, void* input,
+                                       size_t count, int truncate,
+                                       const void* residual, const void* gate) {
+    try {
+        if (!handle || !queue || !input || !residual || !gate || count != 16 * 1024 * 1024 ||
+            (reinterpret_cast<uintptr_t>(input) | reinterpret_cast<uintptr_t>(residual) |
+             reinterpret_cast<uintptr_t>(gate)) % 128 != 0) {
+            throw std::invalid_argument("invalid gated sum geometry");
+        }
+        static_cast<Context*>(handle)->run(
+            *static_cast<sycl::queue*>(queue), static_cast<uint16_t*>(input), count,
+            truncate, true, static_cast<const uint16_t*>(residual),
+            static_cast<const uint16_t*>(gate));
         return 0;
     } catch (const std::exception& exc) { last_error = exc.what(); return -1; }
 }
