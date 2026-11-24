@@ -25,6 +25,7 @@ from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_kv_triton import (
 from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_triton import (
     qknorm_complex_rope,
 )
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
     get_current_replay_token,
 )
@@ -1357,10 +1358,16 @@ class QwenImage21TransformerBlock(nn.Module):
         ropes,
         caches,
         prefix_pad,
+        flex_tokens=None,
     ):
         # Cache-DiT's UnifiedBlocks forwards the same args to every layer.
         # Slice here so prefix KV stays per-layer after that wrap.
         caches = [cache[self._layer_id] for cache in caches]
+        if flex_tokens is not None:
+            return flex_tokens.block_forward(
+                self, hidden_states, modulation, prefix_states[0], prefix_modulation,
+                layouts[0], ropes[0], caches[0],
+            )
         scale1, gate1, scale2, gate2 = modulation
         prefixes = [
             apply_modulation(
@@ -1511,7 +1518,12 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
         self.norm_out = QwenImage21OutputNorm(ac.hidden_size, ac.eps)
         self.proj_out = nn.Linear(ac.hidden_size, ac.out_channels, bias=False)
 
+    def _apply(self, fn, recurse=True):
+        self.__dict__.pop("_flex_token_shards", None)
+        return super()._apply(fn, recurse)
+
     def post_load_weights(self):
+        self.__dict__.pop("_flex_token_shards", None)
         super().post_load_weights()
         for block in self.transformer_blocks:
             block.attn.pack_qkv_weights()
@@ -1591,6 +1603,15 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
         # Same extras for every block so Cache-DiT's UnifiedBlocks wrap is valid.
         # Each block slices prefix_caches by _layer_id. Visit once per layer for
         # layerwise offload.
+        token_args = {}
+        if _is_xpu and envs.SGLANG_DIFFUSION_FLEX_CONVROT_TOKEN_PARALLEL:
+            from sglang.multimodal_gen.runtime.models.dits.qwen_image21_flex_tokens import (
+                prepare_tokens,
+            )
+
+            state = prepare_tokens(self, images, layouts, prefix_pad, sp)
+            if state is not None:
+                token_args["flex_tokens"] = state
         for block in self.transformer_blocks:
             images = block(
                 images,
@@ -1601,6 +1622,7 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
                 ropes,
                 prefix_caches,
                 prefix_pad,
+                **token_args,
             )
         output = self.proj_out(self.norm_out(images, temb))
         if sp > 1:

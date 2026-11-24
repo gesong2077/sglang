@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
     SGLANG_DIFFUSION_CONVROT_INT8_BACKEND: str = "auto"
     SGLANG_DIFFUSION_FLEX_TP2_SHM: bool = True
+    SGLANG_DIFFUSION_FLEX_CONVROT_TOKEN_PARALLEL: bool = False
     SGLANG_DIFFUSION_FLEX_TP2_PEER: bool = True
     SGLANG_MOSS_XPU_FAST_ROTATION: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS: str | None = None
@@ -327,6 +328,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "SGLANG_DIFFUSION_FLEX_TP2_PEER": _lazy_bool("SGLANG_DIFFUSION_FLEX_TP2_PEER", "true"),
     "SGLANG_DIFFUSION_FLEX_TP2_SHM": _lazy_bool("SGLANG_DIFFUSION_FLEX_TP2_SHM", "true"),
+    "SGLANG_DIFFUSION_FLEX_CONVROT_TOKEN_PARALLEL": _lazy_bool(
+        "SGLANG_DIFFUSION_FLEX_CONVROT_TOKEN_PARALLEL"
+    ),
     # Algebraically equivalent butterfly order can change near-tie A8 codes.
     "SGLANG_MOSS_XPU_FAST_ROTATION": _lazy_bool("SGLANG_MOSS_XPU_FAST_ROTATION"),
     # Path to a Parallel Decoding Distillation head stack (one fused output head
