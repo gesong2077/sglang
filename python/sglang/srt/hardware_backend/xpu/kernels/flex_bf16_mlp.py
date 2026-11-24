@@ -93,47 +93,83 @@ def _fake(x, packed):
     return x.new_empty(1, 4096, 12288)
 
 
-def _packed_weight(x, wide, gate, up):
+def _cached_weight(source, parameters, name, size, materialize):
     ctx = get_forward_context_or_none()
     if (
         ctx is None
         or not ctx.is_denoising
         or ctx.forward_batch is None
-        or gate.is_inference()
-        or up.is_inference()
+        or any(w.is_inference() for w in parameters)
     ):
         return None
-    # A request owns the derived weights until its denoising stage finishes.
-    # This leaves the original Parameters visible to hooks/loaders and frees
-    # the cache before VAE decode, including after interrupted requests.
+    # The request owns the derived weights for this denoising loop. Loaders and
+    # hooks always see the canonical Parameters, including at other resolutions.
     state = ctx.forward_batch.extra.setdefault(DENOISING_LOOP_STATE, {})
-    cache = state.setdefault("flex_bf16_gate_up", {})
-    key = id(gate)
-    stamp = (wide.data_ptr(), id(up), gate._version, up._version)
+    cache = state.setdefault(name, {})
+    key = id(parameters[0])
+    stamp = (source.data_ptr(), tuple((id(w), w._version) for w in parameters))
     entry = cache.get(key)
-    stream = torch.xpu.current_stream(x.device)
+    device = source.device
+    stream = torch.xpu.current_stream(device)
     if entry is None or entry[0] != stamp:
-        plan = _plan(x.device)
-        free, _ = torch.xpu.mem_get_info(x.device)
-        reusable = torch.xpu.memory_reserved(x.device) - torch.xpu.memory_allocated(
-            x.device
+        free, _ = torch.xpu.mem_get_info(device)
+        reusable = torch.xpu.memory_reserved(device) - torch.xpu.memory_allocated(
+            device
         )
         # Allow room for a complete unquantized image block and the TP2 bridge.
-        if free + reusable < plan.packed_bytes + (1536 << 20):
+        if free + reusable < size() + (1536 << 20):
             return None
-        packed = torch.empty(plan.packed_bytes, device=x.device, dtype=torch.uint8)
-        if plan.lib.flex_mlp_pack(
-            plan.handle, stream.sycl_queue, wide.data_ptr(), packed.data_ptr()
-        ):
-            raise RuntimeError(plan.lib.flex_mlp_error().decode())
-        wide.record_stream(stream)
+        try:
+            packed = materialize(stream)
+        except torch.OutOfMemoryError:
+            # Fragmented allocator blocks may not satisfy an otherwise fitting allocation.
+            return None
+        source.record_stream(stream)
         ready = torch.xpu.Event()
         ready.record(stream)
         entry = cache[key] = (stamp, packed, stream, ready)
     _, packed, producer, ready = entry
     if producer != stream:
         stream.wait_event(ready)
+        packed.record_stream(stream)
     return packed
+
+
+def _packed_weight(x, wide, gate, up):
+    def materialize(stream):
+        plan = _plan(x.device)
+        packed = torch.empty(plan.packed_bytes, device=x.device, dtype=torch.uint8)
+        if plan.lib.flex_mlp_pack(
+            plan.handle, stream.sycl_queue, wide.data_ptr(), packed.data_ptr()
+        ):
+            raise RuntimeError(plan.lib.flex_mlp_error().decode())
+        return packed
+
+    return _cached_weight(
+        wide,
+        (gate, up),
+        "flex_bf16_gate_up",
+        lambda: _plan(x.device).packed_bytes,
+        materialize,
+    )
+
+
+def down_weight(weight):
+    """Cache the transposed layout only for a measured 4096-token image."""
+    if (
+        weight.device.type != "xpu"
+        or weight.dtype != torch.bfloat16
+        or weight.shape != (4096, 6144)
+        or not weight.is_contiguous()
+    ):
+        return None
+    return _cached_weight(
+        weight,
+        (weight,),
+        "flex_bf16_down",
+        lambda: weight.numel() * weight.element_size(),
+        lambda stream: weight.T.contiguous().T,
+    )
 
 
 def packed_gate_up(x, wide, gate, up, logger):

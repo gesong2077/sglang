@@ -579,21 +579,26 @@ class _FlexTP2DownMethod(UnquantizedLinearMethod):
     def apply(self, layer, x, bias=None):
         w = layer.weight
         if (
-            x.shape == (1, 4096, 6144)
+            x.device.type == "xpu"
+            and x.shape == (1, 4096, 6144)
             and x.stride(-2) == 6160
             and x.stride(-1) == 1
             and x.dtype == torch.bfloat16
-            and w.T.is_contiguous()
+            and not _FLEX_PADDED_DOWN.disabled
             and not torch.compiler.is_compiling()
             and not torch.is_grad_enabled()
         ):
-            return _FLEX_PADDED_DOWN.run(
-                lambda: apply_unquantized_linear(x, w, bias),
-                lambda: apply_unquantized_linear(x.contiguous(), w.contiguous(), bias),
-                sig=x.device,
-                logger=logger,
-            )
-        return apply_unquantized_linear(x.contiguous(), w.contiguous(), bias)
+            from sglang.srt.hardware_backend.xpu.kernels.flex_bf16_mlp import down_weight
+
+            transposed = down_weight(w)
+            if transposed is not None:
+                return _FLEX_PADDED_DOWN.run(
+                    lambda: apply_unquantized_linear(x, transposed, bias),
+                    lambda: apply_unquantized_linear(x.contiguous(), w, bias),
+                    sig=x.device,
+                    logger=logger,
+                )
+        return apply_unquantized_linear(x, w, bias)
 
 
 class QwenImage21FeedForward(nn.Module):
@@ -631,7 +636,7 @@ class QwenImage21FeedForward(nn.Module):
             return
         weight = self.out.weight
         if (
-            type(self.out.quant_method) in (UnquantizedLinearMethod, _FlexTP2DownMethod)
+            type(self.out.quant_method) is UnquantizedLinearMethod
             and self.out.tp_size == 2
             and weight.device.type == "xpu"
             and weight.dtype == torch.bfloat16
@@ -639,7 +644,6 @@ class QwenImage21FeedForward(nn.Module):
             and b60.is_flex_device(weight.device)
             and weight.is_contiguous()
         ):
-            weight.data = weight.T.contiguous().T
             self.out.quant_method = _FlexTP2DownMethod()
             return
         if (
@@ -728,6 +732,7 @@ class QwenImage21FeedForward(nn.Module):
 
                 def grouped():
                     from sglang.srt.hardware_backend.xpu.kernels.flex_bf16_mlp import (
+                        down_weight,
                         packed_gate_up,
                     )
 
@@ -742,6 +747,7 @@ class QwenImage21FeedForward(nn.Module):
                         and not self.out._forward_pre_hooks
                         and not self.out._forward_hooks
                         and not _FLEX_PADDED_DOWN.disabled
+                        and down_weight(self.out.weight) is not None
                     )
                     return b60.fused_pointwise(
                         gate,
