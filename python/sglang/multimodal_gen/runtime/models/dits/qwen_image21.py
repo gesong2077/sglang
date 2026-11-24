@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+from contextlib import contextmanager
 
 import torch
 from torch import nn
@@ -1518,17 +1519,39 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
         self.norm_out = QwenImage21OutputNorm(ac.hidden_size, ac.eps)
         self.proj_out = nn.Linear(ac.hidden_size, ac.out_channels, bias=False)
 
+    @contextmanager
+    def _changing_flex_token_weights(self):
+        state = getattr(self, "_flex_token_shards", None)
+        if state is None:
+            yield
+            return
+        # _apply can return the original INT8 Parameter (for instance, a dtype
+        # cast) or move its storage to another device. Wait before fn sees it.
+        state.stamp = None
+        state.wait_before_weight_change()
+        try:
+            yield
+        finally:
+            from sglang.multimodal_gen.runtime.models.dits.qwen_image21_flex_tokens import (
+                _retire,
+            )
+
+            # Only still-aliased Parameters need independent local storage.
+            # If a clone runs out of memory, _retire keeps the invalid state
+            # so the next request can finish reclaiming its peer allocations.
+            _retire(self)
+
     def _apply(self, fn, recurse=True):
-        self.__dict__.pop("_flex_token_shards", None)
-        return super()._apply(fn, recurse)
+        with self._changing_flex_token_weights():
+            return super()._apply(fn, recurse)
 
     def post_load_weights(self):
-        self.__dict__.pop("_flex_token_shards", None)
-        super().post_load_weights()
-        for block in self.transformer_blocks:
-            block.attn.pack_qkv_weights()
-            block.img_mlp.pack_gate_up_weights()
-            block.img_mlp.pad_b60_down_weight()
+        with self._changing_flex_token_weights():
+            super().post_load_weights()
+            for block in self.transformer_blocks:
+                block.attn.pack_qkv_weights()
+                block.img_mlp.pack_gate_up_weights()
+                block.img_mlp.pad_b60_down_weight()
 
     def prepare_lora_adapter(self, adapter):
         return _split_fused_gate_up_lora(

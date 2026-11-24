@@ -22,7 +22,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.hardware_backend.xpu.quantization.moss_convrot import (
-    _rotate_pack_rows,
+    pack_flex_token_rows,
     pack_flex_gate_up_pair,
     project_packed,
     rotate_and_pack,
@@ -254,9 +254,7 @@ def _pack_half(x):
     rows, width = x.shape[-2:]
     raw = torch.empty(rows * (width + 4), device=x.device, dtype=torch.uint8)
     packed = _half_view(raw, rows, width)
-    _rotate_pack_rows[(rows,)](
-        x, packed.values, packed.scales, width, 256, width, num_warps=4
-    )
+    pack_flex_token_rows(x, packed.values, packed.scales, width)
     return raw, packed
 
 
@@ -270,6 +268,7 @@ class TokenShards:
         self.stamp = stamp
         self.ready = None
         self.stream = None
+        self.reader_streams = set()
         self.truncate = bridge.round_toward_zero[4096 * 4096]
 
     def ordered(self, own, other):
@@ -288,16 +287,12 @@ class TokenShards:
             raw[-scale_bytes:].view(torch.float32),
         )
         parts = raw.view(2, half_bytes)
-        _rotate_pack_rows[(rows,)](
+        pack_flex_token_rows(
             normalized,
             values.narrow(0, self.rank * rows, rows),
             scales[self.rank],
             width,
-            256,
-            width,
-            MODULATION=modulation,
-            MODULATE=True,
-            num_warps=8,
+            modulation=modulation,
         )
         self.bridge.peer_exchange(parts[self.rank], out=parts[1 - self.rank])
         return W8A8Activation(values, torch.cat(scales), (1, 2 * rows, width))
@@ -436,8 +431,18 @@ class TokenShards:
         self.ready = self.stream.record_event()
         return True
 
+    def wait_before_weight_change(self):
+        # ready marks completion of the initial peer copies. A later inference
+        # may still be reading these same allocations on a different queue.
+        current = torch.xpu.current_stream(self.stream.device)
+        for reader in self.reader_streams | {self.stream}:
+            if reader != current:
+                current.wait_stream(reader)
+        self.on_stream(current)
+
     def on_stream(self, stream):
         if stream != self.stream:
+            self.reader_streams.add(stream)
             stream.wait_event(self.ready)
             for slabs in self.slabs.values():
                 for weight, scale in slabs:
@@ -483,10 +488,7 @@ class TokenShards:
             )
 
         def pack(inp, codes, scales):
-            with torch.xpu.device(inp.device):
-                _rotate_pack_rows[(rows,)](
-                    inp, codes, scales, width, 256, width, num_warps=4
-                )
+            pack_flex_token_rows(inp, codes, scales, width)
 
         send = torch.empty(half, device=x.device, dtype=torch.uint8)
         pack(peer, *views(send, self.rank))
@@ -563,7 +565,9 @@ class TokenShards:
         else:
             out, columns, down = slabs
             x = self.slab_attention_output(attention, x, mod[1], out)
-        packed = rotate_and_pack(block.img_norm2(x), 256, modulation=mod[2])
+        packed = rotate_and_pack(
+            block.img_norm2(x), 256, modulation=mod[2], flex_token=True
+        )
         partials = None
         if slabs is not None:
             try:

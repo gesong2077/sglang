@@ -15,3 +15,14 @@ trap 'rm -f "$out"' EXIT
   "-Wl,-rpath,$dnnl_root/lib:$compiler_lib:$tbb_root/lib" -ldnnl -o "$out"
 chmod 755 "$out"
 mv -f "$out" "$pkg/libonednn_w8a8.so"
+
+# Group-256 ESIMD rotation is an optional ACM-G10 device image in the same
+# wheel. Keep both native bridges linked to the active SYCL runtime.
+out=$(mktemp "$pkg/.libflex_convrot.XXXXXXXX")
+"$compiler" -std=c++20 -O2 -fp-model=precise -ffp-contract=off -fPIC -shared \
+  -fsycl -fsycl-targets=intel_gpu_acm_g10 -Xs "-options '-doubleGRF'" \
+  "$pkg/flex_convrot.cpp" -Wl,--disable-new-dtags \
+  '-Wl,-rpath,$ORIGIN:$ORIGIN/../../../../../../..' \
+  "-Wl,-rpath,$compiler_lib" -o "$out"
+chmod 755 "$out"
+mv -f "$out" "$pkg/libflex_convrot.so"

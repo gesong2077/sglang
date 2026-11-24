@@ -84,6 +84,8 @@ def _rotate_pack_rows(
     MODULATION=None,
     MODULATE: tl.constexpr = False,
     PAIRED_GATE_UP: tl.constexpr = False,
+    REPAIR=None,
+    MASKED: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     col = tl.arange(0, BLOCK)
@@ -95,6 +97,9 @@ def _rotate_pack_rows(
         source = row.to(tl.int64) * (4 * WIDTH) + part * (2 * WIDTH) + col
         offsets += part * tl.num_programs(0) * WIDTH
         scale_row += part * tl.num_programs(0)
+    if MASKED:
+        if tl.load(REPAIR + scale_row) == 0:
+            return
     activation = tl.load(X + source, col < WIDTH, 0)
     if SWIGLU:
         # The lookup table reproduces ATen's BF16 SiLU for every input bit pattern.
@@ -128,6 +133,32 @@ def _rotate_pack_rows(
     tl.store(S + scale_row, scale)
 
 
+def pack_flex_token_rows(x, values, scales, width, *, modulation=None, silu_table=None):
+    from .flex_convrot import pack_if_supported
+
+    paired = silu_table is not None
+    rows = values.numel() // (width * (2 if paired else 1))
+    grid = (rows, 2) if paired else (rows,)
+    with torch.xpu.device(x.device):
+        repair = pack_if_supported(x, values, scales, width, modulation, silu_table)
+        _rotate_pack_rows[grid](
+            x,
+            values,
+            scales,
+            width,
+            256,
+            triton.next_power_of_2(width),
+            SILU_TABLE=silu_table,
+            SWIGLU=paired,
+            PAIRED_GATE_UP=paired,
+            MODULATION=modulation,
+            MODULATE=modulation is not None,
+            REPAIR=repair,
+            MASKED=repair is not None,
+            num_warps=16 if paired else (4 if width == 2048 else 8),
+        )
+
+
 def pack_flex_gate_up_pair(wide, silu_table):
     """Produce canonical [rank, token, channel] INT8 codes and row scales."""
     if (
@@ -141,27 +172,26 @@ def pack_flex_gate_up_pair(wide, silu_table):
     rows, width = 2048, 6144
     values = torch.empty((2, rows, width), device=wide.device, dtype=torch.int8)
     scales = torch.empty((2, rows), device=wide.device, dtype=torch.float32)
-    with torch.xpu.device(wide.device):
-        _rotate_pack_rows[(rows, 2)](
-            wide,
-            values,
-            scales,
-            width,
-            256,
-            8192,
-            SILU_TABLE=silu_table,
-            SWIGLU=True,
-            PAIRED_GATE_UP=True,
-            num_warps=16,
-        )
+    pack_flex_token_rows(wide, values, scales, width, silu_table=silu_table)
     return values, scales
 
 
-def rotate_and_pack(x, group, *, swiglu_value=None, silu_table=None, modulation=None):
+def rotate_and_pack(
+    x, group, *, swiglu_value=None, silu_table=None, modulation=None, flex_token=False
+):
     width = x.size(-1)
     rows = x.numel() // width
     values = torch.empty((rows, width), dtype=torch.int8, device=x.device)
     scales = torch.empty(rows, dtype=torch.float32, device=x.device)
+    if (
+        flex_token
+        and group == 256
+        and width == 4096
+        and swiglu_value is None
+        and modulation is not None
+    ):
+        pack_flex_token_rows(x, values, scales, width, modulation=modulation)
+        return W8A8Activation(values, scales, x.shape, x.dtype)
     warps = 16 if width == 8192 else 8
     if group == 256 and torch.xpu.get_device_properties(x.device).device_id == 0x56C0:
         warps = {2048: 4, 6144: 16}.get(width, warps)

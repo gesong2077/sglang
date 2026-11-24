@@ -169,3 +169,101 @@ def test_flex_batched_gate_up_and_row_projection_match_both_tp_shards():
         )
         expected = project_packed(tensor, weights[rank], channels[rank])
         assert torch.equal(combined[rank], expected[0])
+
+
+@pytest.mark.parametrize("width", [2048, 4096, 6144])
+@torch.inference_mode()
+def test_flex_mixed_rotation_repairs_exceptional_rows_bitwise(width):
+    from sglang.kernels.ops.diffusion.rope.qwen_image21_b60 import silu_table
+    from sglang.srt.hardware_backend.xpu.quantization.flex_convrot import (
+        _library,
+        pack_if_supported,
+    )
+    from sglang.srt.hardware_backend.xpu.quantization.moss_convrot import (
+        _rotate_pack_rows,
+        pack_flex_token_rows,
+    )
+
+    dev = torch.device("xpu", torch.xpu.current_device())
+    if torch.xpu.get_device_properties(dev).device_id != 0x56C0 or _library() is None:
+        pytest.skip("requires the optional Flex 170 native rotation library")
+    paired = width == 6144
+    generator = torch.Generator(device=dev).manual_seed(7211)
+    x = torch.randn(
+        (1, 2048, 24576 if paired else width),
+        device=dev,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    # Keep the named control row ordinary. Plant both signs and a single BF16
+    # subnormal by bit pattern, so the fixture is independent of host FP mode.
+    bits = [0x7FC1, 0x7F80, -128, 1, 0x5F80, 0x1F00, 0x7F7F]
+    edge = torch.tensor(bits, device=dev, dtype=torch.int16).view(torch.bfloat16)
+    x[0, : len(bits), 11] = edge
+    x[0, len(bits)].zero_()
+    impulse = len(bits) + 1
+    x[0, impulse].zero_()
+    x[0, impulse, 0] = 1
+    if paired:
+        x[0, impulse, width] = 1
+        x[0, impulse, 2 * width] = 1
+        x[0, impulse, 3 * width] = 1
+    if paired:
+        x[0, : len(bits), 2 * width + 17] = edge.flip([0])
+    modulation = (
+        torch.zeros((1, 1, width), device=dev, dtype=x.dtype) if width == 4096 else None
+    )
+    table = silu_table(dev) if paired else None
+    shape = (2, 2048, width) if paired else (2048, width)
+    codes = torch.empty(shape, device=dev, dtype=torch.int8)
+    scales = torch.empty(shape[:-1], device=dev, dtype=torch.float32)
+    mask = pack_if_supported(x, codes, scales, width, modulation, table)
+    assert mask is not None
+    assert mask.reshape(-1, 2048)[:, : len(bits)].all().item()
+    assert not mask.reshape(-1, 2048)[:, len(bits)].any().item()
+    ref_codes, ref_scales = torch.empty_like(codes), torch.empty_like(scales)
+    grid = (2048, 2) if paired else (2048,)
+    _rotate_pack_rows[grid](
+        x,
+        ref_codes,
+        ref_scales,
+        width,
+        256,
+        8192 if paired else width,
+        SILU_TABLE=table,
+        SWIGLU=paired,
+        PAIRED_GATE_UP=paired,
+        MODULATION=modulation,
+        MODULATE=modulation is not None,
+        num_warps=16 if paired else (4 if width == 2048 else 8),
+    )
+    pack_flex_token_rows(
+        x, codes, scales, width, modulation=modulation, silu_table=table
+    )
+    assert torch.equal(codes, ref_codes)
+    assert torch.equal(scales.view(torch.int32), ref_scales.view(torch.int32))
+    # Independent CPU oracle for a sparse physical row. The regular H4
+    # has the negative entry at input index (output index XOR 3).
+    host = torch.zeros(width)
+    host[0] = (
+        torch.nn.functional.silu(torch.tensor(1, dtype=torch.bfloat16)).float()
+        if paired
+        else 1
+    )
+    for stride in (1, 4, 16, 64):
+        a, b, c, d = host.view(-1, 4, stride).unbind(1)
+        host = torch.stack(
+            (
+                (a + b) + (c - d),
+                (a + b) + (d - c),
+                (c + d) + (a - b),
+                (c + d) + (b - a),
+            ),
+            1,
+        ).reshape(-1)
+    host *= 0.0625
+    scale = host.abs().max() * (1 / 127)
+    expected = (host / scale).round().to(torch.int8)
+    for vc, sc in zip(codes.reshape(-1, 2048, width), scales.reshape(-1, 2048)):
+        assert torch.equal(vc[impulse].cpu(), expected)
+        assert torch.equal(sc[impulse].cpu().view(torch.int32), scale.view(torch.int32))
