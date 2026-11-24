@@ -87,6 +87,9 @@ _FLEX_SWIGLU_PACK = BitExactFusionGate(
 _FLEX_GATE_UP = BitExactFusionGate(
     "Flex 170 BF16 gate/up and SwiGLU", per_signature=True
 )
+_FLEX_PADDED_DOWN = BitExactFusionGate(
+    "Flex 170 padded BF16 MLP down", per_signature=True
+)
 _FLEX_QKV = BitExactFusionGate("Flex 170 BF16 batch Q/K/V", per_signature=True)
 _XPU_QK = BitExactFusionGate("XPU Q/K RMSNorm + RoPE", per_signature=True)
 _B60_RESIDUAL = BitExactFusionGate("B60 BF16 gated residual")
@@ -570,6 +573,29 @@ class _FlexTP2ColumnMethod(UnquantizedLinearMethod):
         return apply_unquantized_linear(x, w, bias)
 
 
+class _FlexTP2DownMethod(UnquantizedLinearMethod):
+    """Use the transposed down matrix for the padded 4096-token image only."""
+
+    def apply(self, layer, x, bias=None):
+        w = layer.weight
+        if (
+            x.shape == (1, 4096, 6144)
+            and x.stride(-2) == 6160
+            and x.stride(-1) == 1
+            and x.dtype == torch.bfloat16
+            and w.T.is_contiguous()
+            and not torch.compiler.is_compiling()
+            and not torch.is_grad_enabled()
+        ):
+            return _FLEX_PADDED_DOWN.run(
+                lambda: apply_unquantized_linear(x, w, bias),
+                lambda: apply_unquantized_linear(x.contiguous(), w.contiguous(), bias),
+                sig=x.device,
+                logger=logger,
+            )
+        return apply_unquantized_linear(x.contiguous(), w.contiguous(), bias)
+
+
 class QwenImage21FeedForward(nn.Module):
     def __init__(self, dim, ratio, quant_config, prefix):
         super().__init__()
@@ -604,6 +630,18 @@ class QwenImage21FeedForward(nn.Module):
         if not isinstance(self.out.quant_method, UnquantizedLinearMethod):
             return
         weight = self.out.weight
+        if (
+            type(self.out.quant_method) in (UnquantizedLinearMethod, _FlexTP2DownMethod)
+            and self.out.tp_size == 2
+            and weight.device.type == "xpu"
+            and weight.dtype == torch.bfloat16
+            and weight.shape == (4096, 6144)
+            and b60.is_flex_device(weight.device)
+            and weight.is_contiguous()
+        ):
+            weight.data = weight.T.contiguous().T
+            self.out.quant_method = _FlexTP2DownMethod()
+            return
         if (
             weight.shape != (4096, 6144)
             or not b60.supports_b60(weight)
@@ -689,9 +727,27 @@ class QwenImage21FeedForward(nn.Module):
             if wide is not None and not _FLEX_GATE_UP.disabled:
 
                 def grouped():
-                    gate, up = (x @ wide).chunk(2, dim=-1)
+                    from sglang.srt.hardware_backend.xpu.kernels.flex_bf16_mlp import (
+                        packed_gate_up,
+                    )
+
+                    gate, up = packed_gate_up(
+                        x, wide, self.gate_layer.weight, self.proj.weight, logger
+                    ).chunk(2, dim=-1)
+                    pad = (
+                        type(self.out) is RowParallelLinear
+                        and type(self.out.quant_method) is _FlexTP2DownMethod
+                        and not self.out.training
+                        and "forward" not in self.out.__dict__
+                        and not self.out._forward_pre_hooks
+                        and not self.out._forward_hooks
+                        and not _FLEX_PADDED_DOWN.disabled
+                    )
                     return b60.fused_pointwise(
-                        gate, up, input_row_padding=gate.shape[-1]
+                        gate,
+                        up,
+                        input_row_padding=gate.shape[-1],
+                        output_row_padding=16 if pad else 0,
                     )
 
                 hidden = _FLEX_GATE_UP.run(
